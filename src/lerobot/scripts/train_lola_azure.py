@@ -102,15 +102,12 @@ def setup_distributed():
     node_rank = int(os.environ.get("NODE_RANK", 0))
     master_addr = os.environ.get("MASTER_ADDR", "localhost")
     master_port = os.environ.get("MASTER_PORT", "29500")
+    master_uri = "tcp://%s:%s" % (master_addr, master_port)
 
     # 设置当前设备
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
 
     if world_size > 1:
-        # 构建 master URI
-        master_uri = f"tcp://{master_addr}:{master_port}"
-
+        
         # 初始化进程组
         dist.init_process_group(
             backend="nccl",
@@ -124,7 +121,9 @@ def setup_distributed():
                     f"world_size={world_size}, master={master_uri}")
     else:
         logger.info(f"Single GPU mode: local_rank={local_rank}")
-
+    
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
     return {
         "world_size": world_size,
         "local_rank": local_rank,

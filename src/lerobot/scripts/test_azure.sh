@@ -17,13 +17,17 @@
 
 set -e
 
+# 环境变量设置
+export OPENSSL_FIPS=0  # 禁用 FIPS 避免自检失败
+export TOKENIZERS_PARALLELISM=false
+
 # ----------------------------------------------------------------------
 # 默认参数（可被命令行参数覆盖）
 # ----------------------------------------------------------------------
 NNODES=1
 NPROC_PER_NODE=1
 NODE_RANK=0
-MASTER_ADDR="localhost"
+MASTER_ADDR="127.0.0.1"  # 使用 IP 而非 localhost，避免 IPv6 问题
 MASTER_PORT=29500
 
 # 训练参数
@@ -183,14 +187,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ----------------------------------------------------------------------
-# 设置分布式环境变量
-# 计算 WORLD_SIZE = NNODES * NPROC_PER_NODE
-# ----------------------------------------------------------------------
-export WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
-export MASTER_ADDR="${MASTER_ADDR}"
-export MASTER_PORT="${MASTER_PORT}"
-export NODE_RANK="${NODE_RANK}"
 
 # 打印配置信息
 echo "========================================"
@@ -217,24 +213,42 @@ echo "========================================"
 # ----------------------------------------------------------------------
 # 启动训练
 # 使用 torchrun 来管理多 GPU，每个节点运行一次
+# 单节点时使用简化命令，多节点时使用完整参数
 # ----------------------------------------------------------------------
-cmd="torchrun \
-    --nnodes=${NNODES} \
-    --nproc_per_node=${NPROC_PER_NODE} \
-    --node_rank=${NODE_RANK} \
-    --master_addr=${MASTER_ADDR} \
-    --master_port=${MASTER_PORT} \
-    src/lerobot/scripts/train_lola_azure.py \
-    --strategy ${STRATEGY} \
-    --batch_size ${BATCH_SIZE} \
-    --max_steps ${MAX_STEPS} \
-    --learning_rate ${LEARNING_RATE} \
-    --log_every_n_steps ${LOG_EVERY_N_STEPS} \
-    --save_every_n_steps ${SAVE_INTERVAL} \
-    --gradient_clip_val ${GRADIENT_CLIP_VAL} \
-    --vlm_path ${VLM_PATH} \
-    --ckpt_dir ${CKPT_DIR} \
-    --wandb_project ${WANDB_PROJECT}"
+if [ "$NNODES" -eq 1 ]; then
+    # 单节点：使用简化的 torchrun 命令
+    cmd="torchrun --nproc_per_node=${NPROC_PER_NODE} \
+        src/lerobot/scripts/train_lola_azure.py \
+        --strategy ${STRATEGY} \
+        --batch_size ${BATCH_SIZE} \
+        --max_steps ${MAX_STEPS} \
+        --learning_rate ${LEARNING_RATE} \
+        --log_every_n_steps ${LOG_EVERY_N_STEPS} \
+        --save_every_n_steps ${SAVE_INTERVAL} \
+        --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --vlm_path ${VLM_PATH} \
+        --ckpt_dir ${CKPT_DIR} \
+        --wandb_project ${WANDB_PROJECT}"
+else
+    # 多节点：使用完整的分布式参数
+    cmd="torchrun \
+        --nnodes=${NNODES} \
+        --nproc_per_node=${NPROC_PER_NODE} \
+        --node_rank=${NODE_RANK} \
+        --master_addr=${MASTER_ADDR} \
+        --master_port=${MASTER_PORT} \
+        src/lerobot/scripts/train_lola_azure.py \
+        --strategy ${STRATEGY} \
+        --batch_size ${BATCH_SIZE} \
+        --max_steps ${MAX_STEPS} \
+        --learning_rate ${LEARNING_RATE} \
+        --log_every_n_steps ${LOG_EVERY_N_STEPS} \
+        --save_every_n_steps ${SAVE_INTERVAL} \
+        --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --vlm_path ${VLM_PATH} \
+        --ckpt_dir ${CKPT_DIR} \
+        --wandb_project ${WANDB_PROJECT}"
+fi
 
 # 数据集参数
 if [ -n "$DATASET_REPO_ID" ]; then
