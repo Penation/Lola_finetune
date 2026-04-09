@@ -286,9 +286,9 @@ class LoLATrainer:
         self.preprocessor = None
         self.postprocessor = None
 
-        # 混合精度
-        self.scaler = torch.amp.GradScaler("cuda")
-        self.use_amp = True  # bf16 或 fp16
+        # 混合精度：BF16 不需要 GradScaler，FP16 才需要
+        self.use_bf16 = True  # 使用 BF16 精度
+        self.scaler = None if self.use_bf16 else torch.amp.GradScaler("cuda")
 
         # 训练状态
         self.global_step = 0
@@ -476,19 +476,28 @@ class LoLATrainer:
                 loss, loss_dict = self.training_step(batch)
 
                 # 反向传播
-                self.scaler.scale(loss).backward()
+                if self.use_bf16:
+                    # BF16: 直接 backward，不需要 scaler
+                    loss.backward()
+                else:
+                    # FP16: 使用 scaler
+                    self.scaler.scale(loss).backward()
 
                 # 梯度裁剪
                 if self.gradient_clip_val > 0:
-                    self.scaler.unscale_(self.optimizer)
+                    if not self.use_bf16:
+                        self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.gradient_clip_val,
                     )
 
                 # 优化器步进
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                if self.use_bf16:
+                    self.optimizer.step()
+                else:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
 
                 # 学习率调度
                 self.scheduler.step()
