@@ -27,7 +27,7 @@ MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
 
 # 运行训练
-cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigpu.py \
+cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_azure.py \
     --dataset_root ${DATASET_ROOT} \
     --strategy ${STRATEGY} \
     --devices ${DEVICES} \
