@@ -29,6 +29,7 @@ import argparse
 import os
 import sys
 from typing import Any, Dict
+import datetime
 
 import torch
 import torch.nn as nn
@@ -562,9 +563,11 @@ def main():
     )
     
     # 回调函数
+    time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_dir = os.path.join(args.ckpt_dir, f"lola-{time_str}")
     callbacks = [
         ModelCheckpoint(
-            dirpath=args.ckpt_dir,
+            dirpath=ckpt_dir,
             filename="lola-{step:06d}",
             save_top_k=-1,  # -1 表示保存所有 checkpoint
             every_n_train_steps=args.save_every_n_steps,
