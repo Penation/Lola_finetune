@@ -1,17 +1,39 @@
 #!/bin/bash
-# LoLA 多卡分布式训练测试脚本
-# 使用 LeRobotDataset 进行训练
+# LoLA Azure 分布式训练脚本
+#
+# 此脚本用于在 Azure ML 上运行分布式训练。
+# Azure ML 会为每个节点运行一次此脚本，并自动传入以下参数：
+#   --nnodes: 节点数量
+#   --nproc_per_node: 每个节点的 GPU 数量
+#   --node_rank: 当前节点的 rank
+#   --master_addr: 主节点 IP
+#   --master_port: 主节点端口
+#
+# 使用方法:
+#   bash test_azure.sh --nnodes $NODES --nproc_per_node $GPUS \
+#       --node_rank $AZUREML_CR_NODE_RANK \
+#       --master_addr $AZ_BATCHAI_JOB_MASTER_NODE_IP \
+#       --master_port 9901
 
-# 基础训练参数
-STRATEGY="fsdp"
-DEVICES=2
-NUM_NODES=1
-BATCH_SIZE=16
+set -e
+
+# ----------------------------------------------------------------------
+# 默认参数（可被命令行参数覆盖）
+# ----------------------------------------------------------------------
+NNODES=1
+NPROC_PER_NODE=1
+NODE_RANK=0
+MASTER_ADDR="localhost"
+MASTER_PORT=29500
+
+# 训练参数
+STRATEGY="ddp"
+BATCH_SIZE=4
 MAX_STEPS=10000
 LEARNING_RATE=2.5e-5
-PRECISION="bf16-mixed"
-LOG_EVERY_N_STEPS=100
+LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
+GRADIENT_CLIP_VAL=1.0
 
 # 数据集参数
 DATASET_REPO_ID=""
@@ -19,32 +41,230 @@ DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3
 
 # 模型参数
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
-CKPT_DIR="/mnt/wangxiaofa/policy_ckpts/lola_ckpts/"
+CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
 
-# 历史action加载参数（可选）
-LOAD_FULL_HISTORY=true  # 设置为true启用完整历史action加载
+# 历史action加载参数
+LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
 
-# 运行训练
-cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_azure.py \
-    --dataset_root ${DATASET_ROOT} \
+# Wandb 参数
+WANDB_PROJECT="lola-azure"
+WANDB_NAME=""
+WANDB_ENTITY=""
+DISABLE_WANDB=false
+
+# Resume 参数
+RESUME=""
+
+# ----------------------------------------------------------------------
+# 解析命令行参数
+# ----------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        # Azure 分布式参数
+        --nnodes)
+            NNODES="$2"
+            shift 2
+            ;;
+        --nproc_per_node)
+            NPROC_PER_NODE="$2"
+            shift 2
+            ;;
+        --node_rank)
+            NODE_RANK="$2"
+            shift 2
+            ;;
+        --master_addr)
+            MASTER_ADDR="$2"
+            shift 2
+            ;;
+        --master_port)
+            MASTER_PORT="$2"
+            shift 2
+            ;;
+
+        # 训练参数
+        --strategy)
+            STRATEGY="$2"
+            shift 2
+            ;;
+        --batch_size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --max_steps)
+            MAX_STEPS="$2"
+            shift 2
+            ;;
+        --learning_rate)
+            LEARNING_RATE="$2"
+            shift 2
+            ;;
+        --log_every_n_steps)
+            LOG_EVERY_N_STEPS="$2"
+            shift 2
+            ;;
+        --save_every_n_steps)
+            SAVE_INTERVAL="$2"
+            shift 2
+            ;;
+        --gradient_clip_val)
+            GRADIENT_CLIP_VAL="$2"
+            shift 2
+            ;;
+
+        # 数据集参数
+        --dataset_repo_id)
+            DATASET_REPO_ID="$2"
+            shift 2
+            ;;
+        --dataset_root)
+            DATASET_ROOT="$2"
+            shift 2
+            ;;
+
+        # 模型参数
+        --vlm_path)
+            VLM_PATH="$2"
+            shift 2
+            ;;
+        --ckpt_dir)
+            CKPT_DIR="$2"
+            shift 2
+            ;;
+
+        # 历史action参数
+        --load_full_history)
+            LOAD_FULL_HISTORY=true
+            shift
+            ;;
+        --no_load_full_history)
+            LOAD_FULL_HISTORY=false
+            shift
+            ;;
+        --max_history_length)
+            MAX_HISTORY_LENGTH="$2"
+            shift 2
+            ;;
+        --history_padding_side)
+            HISTORY_PADDING_SIDE="$2"
+            shift 2
+            ;;
+
+        # Wandb 参数
+        --wandb_project)
+            WANDB_PROJECT="$2"
+            shift 2
+            ;;
+        --wandb_name)
+            WANDB_NAME="$2"
+            shift 2
+            ;;
+        --wandb_entity)
+            WANDB_ENTITY="$2"
+            shift 2
+            ;;
+        --disable_wandb)
+            DISABLE_WANDB=true
+            shift
+            ;;
+
+        # Resume
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
+
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# ----------------------------------------------------------------------
+# 设置分布式环境变量
+# 计算 WORLD_SIZE = NNODES * NPROC_PER_NODE
+# ----------------------------------------------------------------------
+export WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+export MASTER_ADDR="${MASTER_ADDR}"
+export MASTER_PORT="${MASTER_PORT}"
+export NODE_RANK="${NODE_RANK}"
+
+# 打印配置信息
+echo "========================================"
+echo "LoLA Azure Distributed Training"
+echo "========================================"
+echo "Distributed Config:"
+echo "  - Nodes: ${NNODES}"
+echo "  - GPUs per node: ${NPROC_PER_NODE}"
+echo "  - World size: ${WORLD_SIZE}"
+echo "  - Node rank: ${NODE_RANK}"
+echo "  - Master addr: ${MASTER_ADDR}"
+echo "  - Master port: ${MASTER_PORT}"
+echo ""
+echo "Training Config:"
+echo "  - Strategy: ${STRATEGY}"
+echo "  - Batch size: ${BATCH_SIZE}"
+echo "  - Max steps: ${MAX_STEPS}"
+echo "  - Learning rate: ${LEARNING_RATE}"
+echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
+echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
+echo "  - VLM path: ${VLM_PATH}"
+echo "========================================"
+
+# ----------------------------------------------------------------------
+# 启动训练
+# 使用 torchrun 来管理多 GPU，每个节点运行一次
+# ----------------------------------------------------------------------
+cmd="torchrun \
+    --nnodes=${NNODES} \
+    --nproc_per_node=${NPROC_PER_NODE} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    src/lerobot/scripts/train_lola_azure.py \
     --strategy ${STRATEGY} \
-    --devices ${DEVICES} \
-    --num_nodes ${NUM_NODES} \
     --batch_size ${BATCH_SIZE} \
     --max_steps ${MAX_STEPS} \
     --learning_rate ${LEARNING_RATE} \
-    --precision ${PRECISION} \
     --log_every_n_steps ${LOG_EVERY_N_STEPS} \
     --save_every_n_steps ${SAVE_INTERVAL} \
-    --ckpt_dir \
-    --vlm_path ${VLM_PATH}"
+    --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+    --vlm_path ${VLM_PATH} \
+    --ckpt_dir ${CKPT_DIR} \
+    --wandb_project ${WANDB_PROJECT}"
 
-# 如果启用完整历史action加载
+# 数据集参数
+if [ -n "$DATASET_REPO_ID" ]; then
+    cmd="${cmd} --dataset_repo_id ${DATASET_REPO_ID}"
+else
+    cmd="${cmd} --dataset_root ${DATASET_ROOT}"
+fi
+
+# 历史action参数
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
 fi
 
+# Wandb 参数
+if [ -n "$WANDB_NAME" ]; then
+    cmd="${cmd} --wandb_name ${WANDB_NAME}"
+fi
+if [ -n "$WANDB_ENTITY" ]; then
+    cmd="${cmd} --wandb_entity ${WANDB_ENTITY}"
+fi
+if [ "$DISABLE_WANDB" = true ]; then
+    cmd="${cmd} --disable_wandb"
+fi
+
+# Resume 参数
+if [ -n "$RESUME" ]; then
+    cmd="${cmd} --resume ${RESUME}"
+fi
+
 echo "Running: $cmd"
 eval $cmd
+
+echo "Training completed!"
