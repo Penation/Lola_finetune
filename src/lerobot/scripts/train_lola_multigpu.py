@@ -426,6 +426,7 @@ def get_deepspeed_strategy():
 # 主函数
 # ----------------------------------------------------------------------
 def main():
+    os.environ['WANDB_API_KEY'] = "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"
     parser = argparse.ArgumentParser(description="LoLA Multi-GPU Training with LeRobotDataset")
     
     # 数据集参数
