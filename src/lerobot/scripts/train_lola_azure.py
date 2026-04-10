@@ -45,6 +45,7 @@ import datetime
 import logging
 import os
 import sys
+import time
 from datetime import timedelta
 from typing import Any, Dict
 
@@ -471,6 +472,8 @@ class LoLATrainer:
                 if self.global_step >= self.max_steps:
                     break
 
+                step_start = time.monotonic()
+
                 self.optimizer.zero_grad()
 
                 loss, loss_dict = self.training_step(batch)
@@ -504,6 +507,9 @@ class LoLATrainer:
 
                 self.global_step += 1
 
+                # 计算步耗时
+                update_s = round(time.monotonic() - step_start, 2)
+
                 # 日志
                 if self.global_step % self.log_every_n_steps == 0:
                     lr = self.scheduler.get_last_lr()[0]
@@ -511,7 +517,8 @@ class LoLATrainer:
                         logger.info(
                             f"Step {self.global_step}/{self.max_steps} | "
                             f"Loss: {loss.item():.4f} | "
-                            f"LR: {lr:.2e}"
+                            f"LR: {lr:.2e} | "
+                            f"Update: {update_s}s"
                         )
                         # Wandb 日志
                         if self.use_wandb:
@@ -520,6 +527,7 @@ class LoLATrainer:
                                 "train/learning_rate": lr,
                                 "train/step": self.global_step,
                                 "train/epoch": epoch,
+                                "train/update_s": update_s,
                             }
                             # 添加 loss_dict 中的其他 loss
                             for k, v in loss_dict.items():

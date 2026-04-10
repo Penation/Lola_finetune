@@ -26,8 +26,10 @@ LoLA 多卡分布式训练脚本 - 使用 LeRobotDataset
 """
 
 import argparse
+import datetime
 import os
 import sys
+import time
 from typing import Any, Dict
 import datetime
 
@@ -89,6 +91,9 @@ class LoLALightningModule(pl.LightningModule):
         self.policy = None
         self.preprocessor = None
         self.postprocessor = None
+
+        # 计时
+        self._step_start_time = None
         
     def setup(self, stage=None):
         """在 distributed 环境初始化后加载模型"""
@@ -180,6 +185,8 @@ class LoLALightningModule(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         """训练步骤"""
+        self._step_start_time = time.monotonic()
+
         # 提取特殊字段（避免被preprocessor处理）
         special_data = self._extract_special_fields(batch)
         
@@ -194,6 +201,12 @@ class LoLALightningModule(pl.LightningModule):
         for k, v in loss_dict.items():
             if k != "loss":
                 self.log(f"train_{k}", v, prog_bar=False, sync_dist=True)
+
+        # 记录步耗时
+        if self._step_start_time is not None:
+            update_s = round(time.monotonic() - self._step_start_time, 2)
+            self.log("train_update_s", update_s, prog_bar=False, sync_dist=False)
+
         return loss
 
     def configure_optimizers(self):
