@@ -46,6 +46,7 @@ DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3
 # 模型参数
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
 CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
+TRAIN_VLM=false
 
 # 历史action加载参数
 LOAD_FULL_HISTORY=true
@@ -136,6 +137,10 @@ while [[ $# -gt 0 ]]; do
         --ckpt_dir)
             CKPT_DIR="$2"
             shift 2
+            ;;
+        --train_vlm)
+            TRAIN_VLM=true
+            shift
             ;;
 
         # 历史action参数
@@ -260,6 +265,11 @@ fi
 # 历史action参数
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
+fi
+
+# 训练 VLM 参数
+if [ "$TRAIN_VLM" = true ]; then
+    cmd="${cmd} --train_vlm"
 fi
 
 # Wandb 参数
