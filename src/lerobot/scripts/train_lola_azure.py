@@ -460,7 +460,34 @@ class LoLATrainer:
             logger.info(f"Wandb initialized: {wandb_run_name}")
 
         logger.info(f"Starting training from step {start_step} to {self.max_steps}")
-        logger.info(f"Total batches per epoch: {len(train_loader)}")
+
+        # 计算 resume 时需要跳过的 batch 数
+        # Map-style 数据集：可以用 skip_epochs + break 快速跳过完整 epoch
+        # IterableDataset（streaming）：没有 __len__，只能逐 batch 迭代丢弃
+        try:
+            batches_per_epoch = len(train_loader)
+            logger.info(f"Total batches per epoch: {batches_per_epoch}")
+        except TypeError:
+            batches_per_epoch = None
+            logger.info("IterableDataset detected: cannot determine batches per epoch")
+
+        if start_step > 0 and batches_per_epoch is not None:
+            skip_epochs = start_step // batches_per_epoch
+            skip_batches = start_step % batches_per_epoch
+            logger.info(f"Resuming: skipping {skip_epochs} epochs + {skip_batches} batches")
+        elif start_step > 0 and batches_per_epoch is None:
+            # IterableDataset: 无法按 epoch 跳过，for 循环会创建新迭代器从头开始
+            # 所以 streaming resume 时数据会从头开始，但模型/优化器/scheduler 状态已恢复
+            skip_epochs = 0
+            skip_batches = 0
+            logger.warning(
+                f"Resuming from step {start_step} with IterableDataset: "
+                "data will restart from the beginning (model/optimizer/scheduler states are restored). "
+                "For precise data resume, use map-style dataset or add start_index to IterableDataset."
+            )
+        else:
+            skip_epochs = 0
+            skip_batches = 0
 
         epoch = 0
         while self.global_step < self.max_steps:
@@ -471,6 +498,14 @@ class LoLATrainer:
             for batch_idx, batch in enumerate(train_loader):
                 if self.global_step >= self.max_steps:
                     break
+
+                # Map-style 数据集：跳过已训练的 batch
+                if skip_epochs > 0 or skip_batches > 0:
+                    if skip_epochs > 0:
+                        skip_epochs -= 1
+                        break  # 跳过整个 epoch
+                    skip_batches -= 1
+                    continue
 
                 step_start = time.monotonic()
 
@@ -551,16 +586,26 @@ class LoLATrainer:
     def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
         """保存 checkpoint"""
         if self.strategy == "fsdp":
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.checkpoint import save as save_fsdp_checkpoint
+            from torch.distributed.checkpoint.state_dict import get_state_dict
 
-            # FSDP checkpoint 保存
+            # FSDP checkpoint 保存：用 get_state_dict 获取模型和优化器的分片 state_dict
+            model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
             ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}" if not is_final else "final")
             save_fsdp_checkpoint(
-                self.model.state_dict(),
-                {"step": step},
-                ckpt_path,
+                {
+                    "model": model_sd,
+                    "optimizer": optimizer_sd,
+                    "step": [step],
+                },
+                checkpoint_id=ckpt_path,
             )
+            # scheduler 不支持 torch.distributed.checkpoint，单独用 torch.save 保存
+            if self.is_main_process:
+                torch.save(
+                    {"scheduler_state_dict": self.scheduler.state_dict()},
+                    os.path.join(ckpt_path, "scheduler.pt"),
+                )
         else:
             # DDP checkpoint 保存
             state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
@@ -579,11 +624,23 @@ class LoLATrainer:
         """加载 checkpoint"""
         if self.strategy == "fsdp":
             from torch.distributed.checkpoint import load as load_fsdp_checkpoint
+            from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+            # FSDP checkpoint 加载：先获取空 state_dict 容器，再 load 填充，最后 set 回模型/优化器
+            model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
+            # 用 list 包装 step，因为 int 是不可变对象，load 无法原地修改
+            step_container = [0]
             load_fsdp_checkpoint(
-                self.model.state_dict(),
-                {"step": 0},
-                ckpt_path,
+                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container},
+                checkpoint_id=ckpt_path,
             )
+            set_state_dict(self.model, self.optimizer, model_state_dict=model_sd, optim_state_dict=optimizer_sd)
+            self.global_step = step_container[0]
+            # 恢复 scheduler 状态
+            scheduler_path = os.path.join(ckpt_path, "scheduler.pt")
+            if os.path.exists(scheduler_path):
+                scheduler_ckpt = torch.load(scheduler_path, map_location=self.device)
+                self.scheduler.load_state_dict(scheduler_ckpt["scheduler_state_dict"])
         else:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             if self.is_distributed:
