@@ -40,6 +40,8 @@ from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.lola_dataset import LoLADataset
 from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset
 
+from tqdm import tqdm
+
 
 def build_delta_timestamps(repo_id, root, n_obs_steps=1, action_chunk_size=10, pred_chunk_size=50):
     """根据数据集 FPS 构建 delta_timestamps"""
@@ -360,7 +362,7 @@ def main():
 
     # 主循环：逐条从 streaming 读取，按 episode 分桶
     should_stop = False
-    for item in stream_iter:
+    for item in tqdm(stream_iter):
         key = _item_key(item)
         ep_idx = key[0]
 
