@@ -43,10 +43,5 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --save_every_n_steps ${SAVE_INTERVAL} \
     --vlm_path ${VLM_PATH}"
 
-# 如果启用完整历史action加载
-if [ "$LOAD_FULL_HISTORY" = true ]; then
-    cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
-fi
-
 echo "Running: $cmd"
 eval $cmd
