@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset
+from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig, LoLAPolicy
 from lerobot.policies.factory import make_pre_post_processors
@@ -107,6 +107,11 @@ def create_lola_streaming_dataset(
     buffer_size: int = 1000,
     seed: int = 42,
     shuffle: bool = True,
+    deferred_video_decode: bool = True,
+    async_decode: bool = False,
+    decode_device: str = "cpu",
+    decode_num_threads: int = 1,
+    num_dataloader_workers: int = 0,
 ):
     """创建 LoLA 流式数据集"""
     dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
@@ -133,40 +138,14 @@ def create_lola_streaming_dataset(
         buffer_size=buffer_size,
         seed=seed,
         shuffle=shuffle,
+        deferred_video_decode=deferred_video_decode,
+        async_decode=async_decode,
+        decode_device=decode_device,
+        decode_num_threads=decode_num_threads,
+        num_dataloader_workers=num_dataloader_workers,
     )
 
     return dataset
-
-
-def collate_fn(batch):
-    """自定义 collate 函数"""
-    result = {}
-    variable_length_keys = {"hist_actions_full", "hist_actions_mask"}
-
-    for key in batch[0].keys():
-        values = [item[key] for item in batch]
-
-        if key == "task":
-            result[key] = values
-        elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
-            max_len = max(v.shape[0] for v in values)
-            padded_values = []
-            for v in values:
-                if v.shape[0] < max_len:
-                    pad_len = max_len - v.shape[0]
-                    if key == "hist_actions_full":
-                        padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
-                    else:
-                        padding = torch.zeros(pad_len, dtype=v.dtype)
-                    v = torch.cat([padding, v], dim=0)
-                padded_values.append(v)
-            result[key] = torch.stack(padded_values)
-        elif isinstance(values[0], torch.Tensor):
-            result[key] = torch.stack(values)
-        else:
-            result[key] = values
-
-    return result
 
 
 # 导入训练器（与 train_lola_azure.py 完全相同）
@@ -219,6 +198,17 @@ def main():
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_id", type=str, default=None)
     parser.add_argument("--disable_wandb", action="store_true")
+
+    # 视频解码参数
+    parser.add_argument("--no_deferred", action="store_true",
+                        help="关闭延迟视频解码 (worker 内解码，速度快但 flush 阶段内存峰值)")
+    parser.add_argument("--async_decode", action="store_true",
+                        help="启用异步解码管线 (独立子进程解码 + 持久化大缓存)")
+    parser.add_argument("--decode_device", type=str, default="cpu",
+                        choices=["cpu", "cuda"],
+                        help="视频解码设备 (cpu 或 cuda)")
+    parser.add_argument("--decode_num_threads", type=int, default=1,
+                        help="异步管线解码线程数")
 
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
@@ -284,15 +274,26 @@ def main():
         buffer_size=args.buffer_size,
         seed=args.streaming_seed,
         shuffle=not args.no_shuffle,
+        deferred_video_decode=not args.no_deferred,
+        async_decode=args.async_decode,
+        decode_device=args.decode_device,
+        decode_num_threads=args.decode_num_threads,
+        num_dataloader_workers=args.num_workers,
     )
 
     # IterableDataset 不使用 DistributedSampler，由数据集内部处理分片
-    train_loader = DataLoader(
+    # 使用 AsyncDecodeDataLoader 处理视频解码 + 变长序列 collate
+    raw_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=lambda x: x,  # passthrough, AsyncDecodeDataLoader 会处理 collate
         pin_memory=True,
+    )
+    train_loader = AsyncDecodeDataLoader(
+        dataloader=raw_loader,
+        dataset=train_dataset,
+        collate_fn=AsyncDecodeDataLoader.make_collate_fn(),
     )
 
     # 创建训练器

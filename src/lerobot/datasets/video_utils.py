@@ -245,23 +245,30 @@ def decode_video_frames_torchcodec(
 
     video_path_str = str(video_path)
 
-    # In multiprocessing environment (DataLoader workers), create new decoder each time
-    # to avoid issues with shared file handles
+    # When an explicit decoder_cache is provided, use it even in worker processes.
+    # This enables BoundedVideoDecoderCache (with capacity control) to work in workers,
+    # avoiding the overhead of re-opening video files on every decode call.
+    # When no cache is provided, fall back to creating a new decoder each time
+    # in worker processes (original behavior, to avoid unbounded memory growth).
     try:
         import torch.multiprocessing
         in_worker = torch.multiprocessing.get_context().current_process().name != "MainProcess"
     except Exception:
         in_worker = False
 
-    if in_worker or decoder_cache is None:
-        # Create new decoder for each request in worker processes
+    _created_new_decoder = False
+    if decoder_cache is not None:
+        # Explicit cache provided — use it (supports BoundedVideoDecoderCache in workers)
+        decoder = decoder_cache.get_decoder(video_path_str)
+    elif in_worker:
+        # No cache provided + in worker process — create new decoder each time
+        # to avoid unbounded memory growth with default VideoDecoderCache
         file_handle = fsspec.open(video_path_str).__enter__()
         decoder = VideoDecoder(file_handle, seek_mode="approximate")
+        _created_new_decoder = True
     else:
-        # Use cached decoder in main process
-        if decoder_cache is None:
-            decoder_cache = _default_decoder_cache
-        decoder = decoder_cache.get_decoder(video_path_str)
+        # Main process, no explicit cache — use default global cache
+        decoder = _default_decoder_cache.get_decoder(video_path_str)
 
     try:
         loaded_ts = []
@@ -327,8 +334,8 @@ def decode_video_frames_torchcodec(
 
         return closest_frames
     finally:
-        # Close file handle if we created a new decoder in worker
-        if in_worker:
+        # Close file handle only if we created a new decoder (no cache path)
+        if _created_new_decoder:
             try:
                 file_handle.close()
             except Exception:

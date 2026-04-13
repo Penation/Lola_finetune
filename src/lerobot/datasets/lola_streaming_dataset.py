@@ -39,8 +39,10 @@ LoLA 流式数据集，支持从 Azure Blob 等远程存储流式加载数据。
 import importlib
 import importlib.util
 import concurrent.futures
+import pickle
 import queue
 import threading
+from dataclasses import dataclass
 
 import fsspec
 import numpy as np
@@ -114,93 +116,302 @@ class _DecodeError:
         self.exception = exc
 
 
-class AsyncDecodePipeline:
-    """Dedicated background thread for video decoding with persistent decoder cache.
+@dataclass
+class DecodeProcessConfig:
+    """可 pickle 的解码配置，传递给解码子进程。
 
-    Overlaps video decode with training forward pass:
-    - While GPU processes batch N, decode thread decodes batch N+1
-    - Per-thread BoundedVideoDecoderCache: each worker thread has its own cache,
-      avoiding VideoDecoder thread-safety issues and lock contention
-    - Within a batch, multiple items are decoded in parallel via ThreadPoolExecutor
-    - torchcodec releases GIL during decode, enabling true C-level parallelism
+    将解码所需的所有数据集属性提取为纯数据对象，
+    避免传递整个 LoLAStreamingDataset（含 fsspec 文件句柄等，不可 pickle）。
+    """
+
+    root: str
+    streaming_from_local: bool
+    tolerance_s: float
+    camera_keys: list
+    image_transforms: object  # Callable or None, must be picklable
+    delta_indices: object  # dict or None
+    video_path_template: str  # meta.video_path format string
+    url_root: str
+    # 预提取的 episode 视频路径映射: ep_idx -> video_key -> (chunk_index, file_index)
+    episode_video_map: dict
+    camera_shapes: dict  # camera_key -> shape list, for padding frame
+    decode_device: str
+    decode_num_threads: int
+    cache_size_per_thread: int
+
+
+def _resolve_video_path(config: DecodeProcessConfig, ep_idx: int, video_key: str) -> str:
+    """从 config 重建视频文件路径（等价于 meta.get_video_file_path）。"""
+    chunk_idx, file_idx = config.episode_video_map[ep_idx][video_key]
+    fpath = config.video_path_template.format(
+        video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
+    )
+    root = config.url_root if not config.streaming_from_local else config.root
+    return f"{root}/{fpath}"
+
+
+def _make_padding_frame(camera_shapes: dict, camera_key: str) -> torch.Tensor:
+    """创建全零 padding 帧（等价于 _make_padding_camera_frame）。"""
+    return torch.zeros(camera_shapes[camera_key]).permute(-1, 0, 1)
+
+
+def _compute_padding_mask(config: DecodeProcessConfig, video_frames, query_timestamps, original_timestamps):
+    """计算视频帧 padding mask（等价于 _get_video_frame_padding_mask）。"""
+    padding_mask = {}
+    for video_key, timestamps in original_timestamps.items():
+        if video_key not in video_frames:
+            continue
+        frames = []
+        mask = []
+        padding_frame = _make_padding_frame(config.camera_shapes, video_key)
+        for ts in timestamps:
+            if is_float_in_list(ts, query_timestamps[video_key]):
+                idx = find_float_index(ts, query_timestamps[video_key])
+                frames.append(video_frames[video_key][idx, :])
+                mask.append(False)
+            else:
+                frames.append(padding_frame)
+                mask.append(True)
+        padding_mask[f"{video_key}_is_pad"] = torch.BoolTensor(mask)
+    return padding_mask
+
+
+def _decode_process_main(
+    config: DecodeProcessConfig,
+    light_queue,
+    result_queue,
+    shutdown_event,
+):
+    """解码子进程入口函数。
+
+    在子进程中重建解码基础设施（ThreadPoolExecutor + per-thread cache），
+    然后进入与旧 AsyncDecodePipeline 相同的解码循环。
+
+    Args:
+        config: 解码配置（可 pickle 的纯数据对象）
+        light_queue: torch.multiprocessing.Queue，接收轻量级帧
+        result_queue: torch.multiprocessing.Queue，返回解码后的帧
+        shutdown_event: torch.multiprocessing.Event，关闭信号
+    """
+    # 1. 创建 ThreadPoolExecutor（batch 内并行解码）
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=config.decode_num_threads,
+        thread_name_prefix="DecodeWorker",
+    )
+
+    # 2. Per-thread VideoDecoder cache（与旧 AsyncDecodePipeline 相同机制）
+    tls = threading.local()
+    all_caches = []
+    caches_lock = threading.Lock()
+
+    def get_thread_cache():
+        if not hasattr(tls, "decoder_cache"):
+            cache = BoundedVideoDecoderCache(max_size=config.cache_size_per_thread)
+            tls.decoder_cache = cache
+            with caches_lock:
+                all_caches.append(cache)
+        return tls.decoder_cache
+
+    def get_thread_cuda_cache():
+        if not hasattr(tls, "cuda_decoder_cache"):
+            cuda_cache_size = max(4, config.cache_size_per_thread // 2)
+            cache = BoundedVideoDecoderCache(max_size=cuda_cache_size)
+            tls.cuda_decoder_cache = cache
+            with caches_lock:
+                all_caches.append(cache)
+        return tls.cuda_decoder_cache
+
+    # 3. 视频查询函数（等价于旧 AsyncDecodePipeline._query_videos_cached）
+    def query_videos(query_timestamps, ep_idx):
+        item = {}
+        for video_key, query_ts in query_timestamps.items():
+            video_path = _resolve_video_path(config, ep_idx, video_key)
+
+            if config.decode_device == "cuda":
+                frames = _decode_video_cuda_in_process(
+                    config, video_path, query_ts, get_thread_cuda_cache
+                )
+            else:
+                frames = decode_video_frames_torchcodec(
+                    video_path, query_ts, config.tolerance_s,
+                    decoder_cache=get_thread_cache(),
+                )
+
+            item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
+        return item
+
+    # 4. 单 item 解码函数
+    def decode_one(item):
+        if "_video_lookup" not in item:
+            return item
+
+        item_copy = item.copy()
+        video_lookup = item_copy.pop("_video_lookup", None)
+
+        if video_lookup is None:
+            for cam_key in config.camera_keys:
+                if cam_key not in item_copy:
+                    item_copy[cam_key] = _make_padding_frame(config.camera_shapes, cam_key)
+                    item_copy[f"{cam_key}_is_pad"] = torch.BoolTensor([True])
+            return item_copy
+
+        ep_idx = video_lookup["ep_idx"]
+        q_timestamps = video_lookup["query_timestamps"]
+        original_timestamps = video_lookup["original_timestamps"]
+
+        video_frames = query_videos(q_timestamps, ep_idx)
+
+        if config.image_transforms is not None:
+            for cam in config.camera_keys:
+                video_frames[cam] = config.image_transforms(video_frames[cam])
+
+        item_copy.update(video_frames)
+
+        if config.delta_indices is not None:
+            padding_mask = _compute_padding_mask(
+                config, video_frames, q_timestamps, original_timestamps
+            )
+            item_copy.update(padding_mask)
+
+        return item_copy
+
+    # 5. 主循环
+    while not shutdown_event.is_set():
+        try:
+            items = light_queue.get(block=True, timeout=0.5)
+        except Exception:
+            # queue.Empty or other queue exceptions
+            continue
+
+        if items is None:  # Shutdown sentinel
+            break
+
+        try:
+            decoded = list(executor.map(decode_one, items))
+            result_queue.put(decoded, block=True, timeout=5.0)
+        except Exception as e:
+            try:
+                result_queue.put(_DecodeError(e), block=True, timeout=5.0)
+            except Exception:
+                pass
+
+    # 6. 清理
+    executor.shutdown(wait=False)
+    with caches_lock:
+        for cache in all_caches:
+            try:
+                cache.clear()
+            except Exception:
+                pass
+
+
+def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache):
+    """在解码子进程中使用 CUDA 解码视频帧。"""
+    from torchcodec.decoders import VideoDecoder
+
+    cache = get_cuda_cache()
+    video_path_str = str(video_path)
+
+    with cache._lock:
+        if video_path_str not in cache._cache:
+            file_handle = fsspec.open(video_path_str).__enter__()
+            decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
+            cache._cache[video_path_str] = (decoder, file_handle)
+            cache._key_order.append(video_path_str)
+            # Evict if over capacity
+            while len(cache._cache) > cache._max_size:
+                oldest_key = cache._key_order.pop(0)
+                old_decoder, old_handle = cache._cache.pop(oldest_key)
+                try:
+                    old_handle.close()
+                except Exception:
+                    pass
+        else:
+            # Update access order (LRU)
+            if video_path_str in cache._key_order:
+                cache._key_order.remove(video_path_str)
+            cache._key_order.append(video_path_str)
+
+    decoder = cache._cache[video_path_str][0]
+
+    # Decode frames
+    metadata = decoder.metadata
+    average_fps = metadata.average_fps
+    num_frames = metadata.num_frames
+    frame_indices = [round(ts * average_fps) for ts in timestamps]
+    clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
+    frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
+    frames_batch = decoder.get_frames_at(indices=frame_indices)
+
+    # GPU decode → CPU
+    loaded_frames = [frame.cpu() for frame in frames_batch.data]
+    loaded_ts = [pts.item() for pts in frames_batch.pts_seconds]
+
+    # Tolerance check
+    query_ts_tensor = torch.tensor(timestamps)
+    loaded_ts_tensor = torch.tensor(loaded_ts)
+    dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
+    min_, argmin_ = dist.min(1)
+    clamped_mask_tensor = torch.tensor(clamped_mask)
+    is_within_tol = (min_ < config.tolerance_s) | clamped_mask_tensor
+    assert is_within_tol.all(), (
+        f"Timestamp tolerance violated: {min_[~is_within_tol]} > {config.tolerance_s=}. "
+        f"video: {video_path}"
+    )
+
+    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
+    closest_frames = (closest_frames / 255.0).type(torch.float32)
+    return closest_frames
+
+
+class DecodeProcessPipeline:
+    """独立子进程视频解码管线，带持久化 per-thread VideoDecoder cache。
+
+    与旧 AsyncDecodePipeline（线程）的区别：
+    - 使用 torch.multiprocessing.Process 而非 threading.Thread
+    - 独立 GIL，Python 层代码也可真并行
+    - torch.multiprocessing.Queue 零拷贝传输 tensor（Linux fd sharing）
+    - 内存由队列深度控制：result_queue(maxsize=1) 最多缓冲 1 个解码 batch
 
     Pipeline timeline:
-        Main thread:    [fetch N] [consume decoded N-1] [train N-1] [consume decoded N] [train N] ...
-        Decode thread:           [decode N (parallel)]                  [decode N+1 (parallel)]  ...
+        主进程:       [fetch N] [consume decoded N-1] [train N-1] [consume decoded N] [train N] ...
+        解码子进程:           [decode N (parallel)]                  [decode N+1 (parallel)] ...
 
-    Cache sizing per thread: 2 * num_workers * n_cameras VideoDecoders.
-    Each decoder ~256MB. With 8 workers, 3 cameras, 8 decode threads:
-      8 threads × (2*8*3 decoders × 256MB) ≈ 96GB total.
+    子进程内部:
+        - ThreadPoolExecutor(decode_num_threads) 并行解码 batch 内多个 item
+        - 每个线程有自己的 BoundedVideoDecoderCache（threading.local）
+        - torchcodec 释放 GIL，C 层 FFmpeg 真并行
     """
 
     def __init__(
         self,
-        dataset: "LoLAStreamingDataset",
-        num_workers: int,
-        n_cameras: int,
-        decode_device: str = "cpu",
-        max_queue_size: int = 2,
-        decode_num_threads: int = 4,
+        config: DecodeProcessConfig,
+        light_queue_depth: int = 2,
+        result_queue_depth: int = 1,
     ):
-        self._dataset = dataset
-        self._decode_device = decode_device
-        self._decode_num_threads = decode_num_threads
+        import torch.multiprocessing as mp
 
-        # Cache sizing per thread: 2 * num_workers * n_cameras
-        self._cache_size_per_thread = max(4, 2 * num_workers * n_cameras)
+        self._config = config
+        self._light_queue = mp.Queue(maxsize=light_queue_depth)
+        self._result_queue = mp.Queue(maxsize=result_queue_depth)
+        self._shutdown_event = mp.Event()
+        self._shutdown_called = False
 
-        # Per-thread decoder cache via threading.local()
-        self._tls = threading.local()
-        self._all_caches = []  # Track all caches for cleanup
-        self._caches_lock = threading.Lock()
-
-        # Queues: request = lightweight items in, result = decoded items out
-        self._request_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
-        self._result_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
-
-        # Shutdown coordination
-        self._shutdown_event = threading.Event()
-
-        # Thread pool for parallel decode within a batch
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=decode_num_threads,
-            thread_name_prefix="DecodeWorker",
-        )
-
-        # Start background thread
-        self._thread = threading.Thread(
-            target=self._decode_loop,
-            name="AsyncDecodePipeline",
+        self._process = mp.Process(
+            target=_decode_process_main,
+            args=(self._config, self._light_queue, self._result_queue, self._shutdown_event),
+            name="DecodeProcessPipeline",
             daemon=True,
         )
-        self._thread.start()
+        self._process.start()
 
-    def _get_thread_cache(self) -> BoundedVideoDecoderCache:
-        """Get or create a per-thread BoundedVideoDecoderCache.
-
-        Each ThreadPoolExecutor worker thread gets its own cache instance,
-        so VideoDecoder objects are never shared across threads (thread-safe).
-        """
-        if not hasattr(self._tls, "decoder_cache"):
-            cache = BoundedVideoDecoderCache(max_size=self._cache_size_per_thread)
-            self._tls.decoder_cache = cache
-            with self._caches_lock:
-                self._all_caches.append(cache)
-        return self._tls.decoder_cache
-
-    def _get_thread_cuda_cache(self) -> BoundedVideoDecoderCache:
-        """Get or create a per-thread CUDA decoder cache."""
-        if not hasattr(self._tls, "cuda_decoder_cache"):
-            cuda_cache_size = max(4, self._cache_size_per_thread // 2)
-            cache = BoundedVideoDecoderCache(max_size=cuda_cache_size)
-            self._tls.cuda_decoder_cache = cache
-            with self._caches_lock:
-                self._all_caches.append(cache)
-        return self._tls.cuda_decoder_cache
+        # 注册 atexit 清理，防止主进程 crash 留下僵尸进程
+        import atexit
+        atexit.register(self.shutdown)
 
     def submit(self, items: list[dict]) -> None:
         """Submit lightweight items for decoding. Blocks if queue is full."""
-        self._request_queue.put(items, block=True)
+        self._light_queue.put(items, block=True)
 
     def consume(self) -> list[dict]:
         """Get decoded items. Blocks until available. Raises on decode error."""
@@ -210,178 +421,29 @@ class AsyncDecodePipeline:
         return result
 
     def shutdown(self) -> None:
-        """Signal shutdown and wait for thread to finish."""
+        """Signal shutdown, drain queues, and wait for process to exit."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
         self._shutdown_event.set()
-        # Drain request queue to unblock the thread if it's waiting on put
+        # Drain light_queue to unblock the process if it's waiting on put
         try:
-            while not self._request_queue.empty():
-                self._request_queue.get_nowait()
-        except queue.Empty:
+            while not self._light_queue.empty():
+                self._light_queue.get_nowait()
+        except Exception:
             pass
-        # Put a None sentinel to unblock the thread if it's waiting on get
+        # Put a None sentinel to unblock the process if it's waiting on get
         try:
-            self._request_queue.put(None, block=False)
-        except queue.Full:
+            self._light_queue.put(None, block=False)
+        except Exception:
             pass
-        self._thread.join(timeout=5.0)
-        # Shutdown the executor
-        self._executor.shutdown(wait=False)
-        # Clean up all per-thread caches
-        with self._caches_lock:
-            for cache in self._all_caches:
-                try:
-                    cache.clear()
-                except Exception:
-                    pass
-            self._all_caches.clear()
+        # Wait for process to finish
+        self._process.join(timeout=10.0)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=5.0)
 
-    def _decode_loop(self) -> None:
-        """Main loop running in background thread."""
-        while not self._shutdown_event.is_set():
-            try:
-                items = self._request_queue.get(block=True, timeout=0.5)
-            except queue.Empty:
-                continue
-
-            if items is None:  # Sentinel for shutdown
-                break
-
-            try:
-                decoded = self._decode_batch_with_cache(items)
-                self._result_queue.put(decoded, block=True, timeout=5.0)
-            except Exception as e:
-                try:
-                    self._result_queue.put(_DecodeError(e), block=True, timeout=5.0)
-                except queue.Full:
-                    pass
-
-    def _decode_batch_with_cache(self, items: list[dict]) -> list[dict]:
-        """Decode a batch using the persistent shared cache with parallel item decode.
-
-        Uses ThreadPoolExecutor to decode multiple items in parallel within the
-        batch. torchcodec releases the GIL during FFmpeg decode, so threads
-        achieve true C-level parallelism. The shared cache is thread-safe
-        (protected by BoundedVideoDecoderCache._lock).
-        """
-        def _decode_one(item):
-            if "_video_lookup" not in item:
-                return item
-
-            item_copy = item.copy()
-            video_lookup = item_copy.pop("_video_lookup", None)
-
-            if video_lookup is None:
-                for cam_key in self._dataset.meta.camera_keys:
-                    if cam_key not in item_copy:
-                        item_copy[cam_key] = self._dataset._make_padding_camera_frame(cam_key)
-                        item_copy[f"{cam_key}_is_pad"] = torch.BoolTensor([True])
-                return item_copy
-
-            ep_idx = video_lookup["ep_idx"]
-            query_timestamps = video_lookup["query_timestamps"]
-            original_timestamps = video_lookup["original_timestamps"]
-
-            # Use the pipeline's persistent cache (not the dataset's small worker cache)
-            video_frames = self._query_videos_cached(query_timestamps, ep_idx)
-
-            if self._dataset.image_transforms is not None:
-                for cam in self._dataset.meta.camera_keys:
-                    video_frames[cam] = self._dataset.image_transforms(video_frames[cam])
-
-            item_copy.update(video_frames)
-
-            if self._dataset.delta_indices is not None:
-                padding_mask = self._dataset._get_video_frame_padding_mask(
-                    video_frames, query_timestamps, original_timestamps
-                )
-                item_copy.update(padding_mask)
-
-            return item_copy
-
-        # Parallel decode within the batch
-        decoded = list(self._executor.map(_decode_one, items))
-        return decoded
-
-    def _query_videos_cached(self, query_timestamps, ep_idx):
-        """Query videos using the per-thread persistent decoder cache."""
-        item = {}
-        for video_key, query_ts in query_timestamps.items():
-            root = (
-                self._dataset.meta.url_root
-                if hasattr(self._dataset.meta, "url_root")
-                and self._dataset.streaming_from_local is False
-                else self._dataset.root
-            )
-            video_path = f"{root}/{self._dataset.meta.get_video_file_path(ep_idx, video_key)}"
-
-            if self._decode_device == "cuda":
-                frames = self._decode_video_cuda_cached(video_path, query_ts)
-            else:
-                frames = decode_video_frames_torchcodec(
-                    video_path, query_ts, self._dataset.tolerance_s,
-                    decoder_cache=self._get_thread_cache(),
-                )
-
-            item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
-        return item
-
-    def _decode_video_cuda_cached(self, video_path, timestamps):
-        """CUDA decode using the per-thread persistent cache."""
-        from torchcodec.decoders import VideoDecoder
-
-        cache = self._get_thread_cuda_cache()
-        video_path_str = str(video_path)
-
-        with cache._lock:
-            if video_path_str not in cache._cache:
-                file_handle = fsspec.open(video_path_str).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-                cache._cache[video_path_str] = (decoder, file_handle)
-                cache._key_order.append(video_path_str)
-                # Evict if over capacity
-                while len(cache._cache) > cache._max_size:
-                    oldest_key = cache._key_order.pop(0)
-                    old_decoder, old_handle = cache._cache.pop(oldest_key)
-                    try:
-                        old_handle.close()
-                    except Exception:
-                        pass
-            else:
-                # Update access order (LRU)
-                if video_path_str in cache._key_order:
-                    cache._key_order.remove(video_path_str)
-                cache._key_order.append(video_path_str)
-
-        decoder = cache._cache[video_path_str][0]
-
-        # Decode frames
-        metadata = decoder.metadata
-        average_fps = metadata.average_fps
-        num_frames = metadata.num_frames
-        frame_indices = [round(ts * average_fps) for ts in timestamps]
-        clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
-        frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
-        frames_batch = decoder.get_frames_at(indices=frame_indices)
-
-        # GPU decode → CPU
-        loaded_frames = [frame.cpu() for frame in frames_batch.data]
-        loaded_ts = [pts.item() for pts in frames_batch.pts_seconds]
-
-        # Tolerance check
-        query_ts_tensor = torch.tensor(timestamps)
-        loaded_ts_tensor = torch.tensor(loaded_ts)
-        dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
-        min_, argmin_ = dist.min(1)
-        clamped_mask_tensor = torch.tensor(clamped_mask)
-        is_within_tol = (min_ < self._dataset.tolerance_s) | clamped_mask_tensor
-        assert is_within_tol.all(), (
-            f"Timestamp tolerance violated: {min_[~is_within_tol]} > {self._dataset.tolerance_s=}. "
-            f"video: {video_path}"
-        )
-
-        closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-        closest_frames = (closest_frames / 255.0).type(torch.float32)
-        return closest_frames
 
 
 class PolarsRowIterator:
@@ -554,7 +616,6 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         decode_num_threads: int = 1,
         async_decode: bool = False,
         num_dataloader_workers: int = 0,
-        worker_decode: bool = False,
     ):
         """
         Args:
@@ -587,21 +648,13 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
                 使用 ThreadPoolExecutor 并行解码多个 item。设为 1 表示串行解码，
                 设为 >1 表示多线程并行（视频解码是 IO 密集型，线程效果较好）。
                 当 decode_device="cuda" 时此参数无效（CUDA 解码本身已并行）。
-            async_decode: 是否启用异步解码管线。启用后，视频解码在专用后台线程中
+            async_decode: 是否启用异步解码管线。启用后，视频解码在专用子进程中
                 执行，与训练前向传播重叠（训练 batch N 时解码 batch N+1）。
-                后台线程维护一个持久化的大型 VideoDecoder 缓存（容量为
-                2 * num_dataloader_workers * n_cameras），避免重复打开/关闭文件。
+                子进程内部使用 ThreadPoolExecutor + per-thread BoundedVideoDecoderCache
+                并行解码，缓存容量为 2 * num_dataloader_workers * n_cameras。
+                内存由队列深度控制：result_queue(maxsize=1) 最多缓冲 1 个解码 batch。
             num_dataloader_workers: DataLoader 的 worker 数量，用于计算异步解码
                 管线的 VideoDecoder 缓存容量。仅在 async_decode=True 时需要。
-            worker_decode: 是否在 worker 进程中解码视频帧。启用后，shuffle buffer
-                存储轻量级帧（~4KB），yield 前在 worker 内解码视频帧。
-                每个 worker 有自己的 BoundedVideoDecoderCache，8 个 worker = 8 倍
-                真正多进程并行解码（比主进程多线程快 2-3 倍）。
-                与 deferred_video_decode=True（主进程解码）相比：
-                - 优点：多进程真并行，吞吐量接近旧方案（17-20 batch/s）
-                - 优点：buffer 存轻量级帧，不会出现 flush 阶段内存飙升
-                - 缺点：解码后帧通过 multiprocessing.Queue 传输，有序列化开销
-                注意：启用时主进程无需调用 decode_items_batch()，收到的已是解码后的帧。
         """
         super().__init__()  # torch.utils.data.IterableDataset.__init__
 
@@ -630,9 +683,6 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         self.async_decode = async_decode
         self._num_dataloader_workers = num_dataloader_workers
         self._decode_pipeline = None
-
-        # Worker 进程解码模式（仅 worker_decode=True 时使用）
-        self.worker_decode = worker_decode
 
         # 加载元数据（不加载 HF dataset）
         self.meta = LeRobotDatasetMetadata(
@@ -748,17 +798,11 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         每个 worker 处理 [row_offset, row_offset + row_limit) 范围内的行。
 
         三种视频解码模式：
-        1. deferred_video_decode=True, worker_decode=False（默认）：
-           worker yield 轻量级帧（~4KB），主进程 decode_items_batch() 解码。
-           内存最优，但主进程解码是瓶颈（单进程多线程，GIL 限制）。
+        1. deferred_video_decode=True（默认）：
+           worker yield 轻量级帧（~4KB），主进程 decode_items_batch() 解码，
+           或通过 async_decode=True 启用独立解码子进程管线。
 
-        2. deferred_video_decode=True, worker_decode=True：
-           buffer 存轻量级帧，yield 前在 worker 内解码。
-           每个 worker 有独立 BoundedVideoDecoderCache，8 worker = 8× 真多进程并行。
-           buffer 不存已解码帧，不会出现 flush 内存飙升。
-           主进程收到的已是解码后的帧，无需再调用 decode_items_batch()。
-
-        3. deferred_video_decode=False：
+        2. deferred_video_decode=False：
            make_frame 中立即解码，buffer 存完整帧（~3.5MB/帧）。
            速度快但 flush 阶段内存飙升（10 workers × 1000 帧 × 3.5MB ≈ 35GB）。
         """
@@ -816,16 +860,17 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         rng = np.random.default_rng(self.seed + rank) if not self.shuffle else np.random.default_rng(self.rng.integers(0, 2**31) + rank)
 
         # 选择帧生成方式：
-        # - deferred + worker_decode: buffer 存轻量级帧，yield 前解码
-        # - deferred (主进程解码): buffer 存轻量级帧，yield 后主进程解码
-        # - 非 deferred: make_frame 中立即解码，buffer 存完整帧
+        # - deferred + async: buffer 存轻量级帧（~4KB），yield 轻量帧，子进程解码
+        # - deferred + 非 async: buffer 存轻量级帧（~4KB），yield 时解码
+        #   （速度和内存的最佳平衡：buffer 省内存，worker 进程解码快于主进程）
+        # - 非 deferred: make_frame 中立即解码，buffer 存完整帧（~3.5MB）
         if self.deferred_video_decode:
             frame_generator = self._make_frame_lightweight
         else:
             frame_generator = self.make_frame
 
-        # 是否在 worker 内解码（yield 前解码，真多进程并行）
-        do_worker_decode = self.deferred_video_decode and self.worker_decode
+        # deferred + 非 async 时，yield 前解码视频（在 worker 进程中执行）
+        decode_on_yield = self.deferred_video_decode and not self.async_decode
 
         # 单 shard 模式：直接迭代，使用 buffer shuffle
         buffer_indices_generator = self._iter_random_indices(rng, self.buffer_size)
@@ -839,8 +884,7 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
                         i = next(buffer_indices_generator)
                         yield_count += 1
                         to_yield = frames_buffer[i]
-                        # worker_decode 模式：在 worker 内解码后再 yield
-                        if do_worker_decode:
+                        if decode_on_yield and "_video_lookup" in to_yield:
                             to_yield = self._decode_videos(to_yield)
                         yield to_yield
                         frames_buffer[i] = frame
@@ -860,9 +904,11 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         yield_count += len(frames_buffer)
         print(f"[LoLAStreamingDataset] Worker {parallel_id} finished, "
               f"total yielded: {yield_count}, buffer: {len(frames_buffer)}", flush=True)
-        if do_worker_decode:
+        if decode_on_yield:
             for frame in frames_buffer:
-                yield self._decode_videos(frame)
+                if "_video_lookup" in frame:
+                    frame = self._decode_videos(frame)
+                yield frame
         else:
             yield from frames_buffer
 
@@ -1061,10 +1107,6 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         if not self.deferred_video_decode:
             return items
 
-        # worker_decode 模式下，帧已在 worker 中解码，直接返回
-        if self.worker_decode:
-            return items
-
         # 过滤出需要解码的 items
         need_decode = ["_video_lookup" in item for item in items]
 
@@ -1193,16 +1235,54 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
     # ── 异步解码管线 ──────────────────────────────────────────────────
 
     def _ensure_decode_pipeline(self):
-        """Lazily create the AsyncDecodePipeline if not already created."""
+        """Lazily create the DecodeProcessPipeline if not already created."""
         if self._decode_pipeline is None:
             n_cameras = max(1, len(self.meta.video_keys))
-            self._decode_pipeline = AsyncDecodePipeline(
-                dataset=self,
-                num_workers=self._num_dataloader_workers,
-                n_cameras=n_cameras,
+            cache_size = max(4, 2 * self._num_dataloader_workers * n_cameras)
+            num_threads = self.decode_num_threads if self.decode_num_threads > 1 else self._num_dataloader_workers
+
+            # 预提取 episode 视频路径映射（避免传递不可 pickle 的 HF datasets.Dataset）
+            episode_video_map = {}
+            for ep_idx in range(len(self.meta.episodes)):
+                ep = self.meta.episodes[ep_idx]
+                episode_video_map[ep_idx] = {}
+                for vid_key in self.meta.video_keys:
+                    episode_video_map[ep_idx][vid_key] = (
+                        ep[f"videos/{vid_key}/chunk_index"],
+                        ep[f"videos/{vid_key}/file_index"],
+                    )
+
+            camera_shapes = {}
+            for k in self.meta.camera_keys:
+                camera_shapes[k] = list(self.meta.info["features"][k]["shape"])
+
+            config = DecodeProcessConfig(
+                root=str(self.root),
+                streaming_from_local=self.streaming_from_local,
+                tolerance_s=self.tolerance_s,
+                camera_keys=list(self.meta.camera_keys),
+                image_transforms=self.image_transforms,
+                delta_indices=self.delta_indices,
+                video_path_template=self.meta.video_path,
+                url_root=self.meta.url_root,
+                episode_video_map=episode_video_map,
+                camera_shapes=camera_shapes,
                 decode_device=self.decode_device,
-                decode_num_threads=self.decode_num_threads if self.decode_num_threads > 1 else self._num_dataloader_workers,
+                decode_num_threads=num_threads,
+                cache_size_per_thread=cache_size,
             )
+
+            # 预检查 config 可 pickle 性
+            try:
+                pickle.dumps(config)
+            except (pickle.PicklingError, TypeError, AttributeError) as e:
+                raise ValueError(
+                    f"DecodeProcessConfig 包含不可 pickle 的属性，无法启动解码子进程: {e}. "
+                    f"请确保 image_transforms 是可 pickle 的（如 torchvision.transforms.Compose 或 None），"
+                    f"而非 lambda 或闭包。"
+                ) from e
+
+            self._decode_pipeline = DecodeProcessPipeline(config)
 
     def shutdown_decode_pipeline(self):
         """Clean up the async decode pipeline. Call at end of training."""
@@ -1213,14 +1293,14 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
     def decode_iter(self, dataloader):
         """Async decode iterator: overlaps video decode with training.
 
-        While the main thread trains on batch N, the decode thread decodes
-        batch N+1 using a persistent large VideoDecoder cache. This hides
-        decode latency behind training compute.
+        While the main process trains on batch N, the decode subprocess
+        decodes batch N+1 using a persistent per-thread VideoDecoder cache.
+        This hides decode latency behind training compute.
 
         Usage:
             for decoded_items in dataset.decode_iter(loader):
                 batch = collate_decoded(decoded_items)
-                loss = model(batch)  # decode thread works on N+1 here
+                loss = model(batch)  # decode process works on N+1 here
 
         Timeline:
             Main:    [fetch N] [consume N-1 + submit N] [train N-1] [consume N + submit N+1] ...
@@ -1543,10 +1623,25 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
 
 
 class AsyncDecodeDataLoader:
-    """Wraps a DataLoader with async video decode + collate for PyTorch Lightning.
+    """Wraps a DataLoader with video decode + collate for PyTorch Lightning.
+
+    Supports three decode modes based on dataset configuration:
+
+    1. deferred_video_decode=True + async_decode=False (yield-time decode, best balance):
+       Workers store lightweight frames in shuffle buffer, decode on yield.
+       Items arrive at DataLoader already decoded. Throughput: ~9-10 batch/s.
+       Memory: only DataLoader's prefetch queue holds decoded frames (~1.8GB).
+
+    2. deferred_video_decode=True + async_decode=True (subprocess pipeline):
+       Workers yield lightweight frames. A dedicated decode subprocess decodes
+       them via decode_iter. Memory-safe with bounded queues.
+
+    3. deferred_video_decode=False (worker decode, fastest):
+       Workers decode video inside make_frame. Items are already decoded.
+       Throughput: ~9-10 batch/s. But flush phase causes memory spike.
 
     Usage:
-        raw_loader = DataLoader(dataset, collate_fn=make_passthrough_collate(), ...)
+        raw_loader = DataLoader(dataset, ...)
         async_loader = AsyncDecodeDataLoader(raw_loader, dataset, collate_fn=collate_decoded)
 
         for batch in async_loader:
@@ -1564,20 +1659,61 @@ class AsyncDecodeDataLoader:
         self._dataset = dataset
         self._collate_fn = collate_fn
 
+    @staticmethod
+    def make_collate_fn():
+        """Create a collate function that handles variable-length tensors.
+
+        This collate fn handles hist_actions_full and hist_actions_mask by
+        left-padding shorter sequences to the max length in the batch,
+        then stacking. All other tensors are stacked normally.
+
+        Use as the DataLoader's collate_fn when items already contain
+        decoded video (deferred_video_decode=True + async_decode=False,
+        or deferred_video_decode=False).
+        """
+        variable_length_keys = AsyncDecodeDataLoader.VARIABLE_LENGTH_KEYS
+
+        def collate_fn(batch):
+            result = {}
+            for key in batch[0].keys():
+                values = [item[key] for item in batch]
+                if key == "task":
+                    result[key] = values
+                elif key in variable_length_keys and isinstance(values[0], torch.Tensor):
+                    max_len = max(v.shape[0] for v in values)
+                    padded_values = []
+                    for v in values:
+                        if v.shape[0] < max_len:
+                            pad_len = max_len - v.shape[0]
+                            if key == "hist_actions_full":
+                                padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
+                            else:
+                                padding = torch.zeros(pad_len, dtype=v.dtype)
+                            v = torch.cat([padding, v], dim=0)
+                        padded_values.append(v)
+                    result[key] = torch.stack(padded_values)
+                elif isinstance(values[0], torch.Tensor):
+                    result[key] = torch.stack(values)
+                else:
+                    result[key] = values
+            return result
+
+        return collate_fn
+
     def __iter__(self):
         if self._dataset.async_decode and self._dataset.deferred_video_decode:
+            # Mode 2: Subprocess decode pipeline (memory-safe).
             for decoded_items in self._dataset.decode_iter(self._loader):
                 if self._collate_fn is not None:
                     yield self._collate_fn(decoded_items)
                 else:
                     yield decoded_items
         else:
-            for items in self._loader:
-                decoded = self._dataset.decode_items_batch(items)
+            # Mode 1 & 3: Items already decoded (yield-time or worker decode).
+            for batch in self._loader:
                 if self._collate_fn is not None:
-                    yield self._collate_fn(decoded)
-                else:
-                    yield decoded
+                    batch = self._collate_fn(batch)
+                yield batch
 
     def __len__(self):
         return len(self._loader)
@@ -1589,3 +1725,7 @@ class AsyncDecodeDataLoader:
     @property
     def num_workers(self):
         return self._loader.num_workers
+
+    @property
+    def dataset(self):
+        return self._loader.dataset

@@ -71,59 +71,9 @@ sys.path.insert(
 
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset
+from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig
-
-
-# ── 与 train_lola_azure_stream.py 保持一致的 collate_fn ──────────────────────
-
-VARIABLE_LENGTH_KEYS = {"hist_actions_full", "hist_actions_mask"}
-
-
-def make_passthrough_collate():
-    """创建直接传递 items 列表的 collate_fn（不含视频解码）。
-
-    关键：PyTorch DataLoader 的 collate_fn 在 worker 进程中运行，
-    不能在这里做视频解码。视频解码在主进程中通过 decode_and_collate() 执行。
-    """
-
-    def collate_fn(batch):
-        return batch
-
-    return collate_fn
-
-
-def decode_and_collate(items, dataset):
-    """在主进程中解码视频并 collate 为 batch dict。"""
-    if dataset.deferred_video_decode:
-        items = dataset.decode_items_batch(items)
-
-    result = {}
-    for key in items[0].keys():
-        values = [item[key] for item in items]
-
-        if key == "task":
-            result[key] = values
-        elif key in VARIABLE_LENGTH_KEYS and isinstance(values[0], torch.Tensor):
-            max_len = max(v.shape[0] for v in values)
-            padded_values = []
-            for v in values:
-                if v.shape[0] < max_len:
-                    pad_len = max_len - v.shape[0]
-                    if key == "hist_actions_full":
-                        padding = torch.zeros(pad_len, v.shape[1], dtype=v.dtype)
-                    else:
-                        padding = torch.zeros(pad_len, dtype=v.dtype)
-                    v = torch.cat([padding, v], dim=0)
-                padded_values.append(v)
-            result[key] = torch.stack(padded_values)
-        elif isinstance(values[0], torch.Tensor):
-            result[key] = torch.stack(values)
-        else:
-            result[key] = values
-
-    return result
 
 
 # ── 校验辅助函数 ──────────────────────────────────────────────────────────────
@@ -427,11 +377,12 @@ def main():
     parser.add_argument("--decode_device", type=str, default="cpu",
                         choices=["cpu", "cuda"],
                         help="视频解码设备 (cpu 或 cuda)")
+    parser.add_argument("--decode_num_threads", type=int, default=1,
+                        help="主进程同步解码线程数 (仅 deferred + 非 async 模式)")
     parser.add_argument("--async_decode", action="store_true",
-                        help="启用异步解码管线 (后台线程解码 + 持久化大缓存)")
-    parser.add_argument("--worker_decode", action="store_true",
-                        help="启用 worker 进程解码 (每个 worker 独立解码视频帧，"
-                             "8 worker = 8× 真多进程并行，主进程收到的已是解码后的帧)")
+                        help="启用异步解码管线 (独立子进程解码 + 持久化大缓存)")
+    parser.add_argument("--no_deferred", action="store_true",
+                        help="关闭延迟视频解码 (worker 内解码，速度快但 flush 阶段内存峰值)")
     args = parser.parse_args()
 
     if args.dataset_repo_id is None and args.dataset_root is None:
@@ -521,9 +472,10 @@ def main():
             seed=args.streaming_seed,
             shuffle=False if args.no_shuffle else True,
             decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
             async_decode=args.async_decode,
             num_dataloader_workers=args.num_workers,
-            worker_decode=args.worker_decode,
+            deferred_video_decode=not args.no_deferred,
         )
         result.ok("LoLAStreamingDataset 创建成功")
     except Exception as e:
@@ -555,17 +507,23 @@ def main():
             seed=args.streaming_seed,
             shuffle=False if args.no_shuffle else True,
             decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
             async_decode=args.async_decode,
             num_dataloader_workers=args.num_workers,
-            worker_decode=args.worker_decode,
+            deferred_video_decode=not args.no_deferred,
         )
 
-        loader = DataLoader(
+        raw_loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            collate_fn=make_passthrough_collate(),
+            collate_fn=lambda x: x,
             pin_memory=False,
+        )
+        async_loader = AsyncDecodeDataLoader(
+            dataloader=raw_loader,
+            dataset=dataset,
+            collate_fn=AsyncDecodeDataLoader.make_collate_fn(),
         )
 
         batch_count = 0
@@ -573,22 +531,7 @@ def main():
         errors_in_iteration = []
         start_time = time.time()
 
-        # 选择迭代模式：异步管线 vs worker 解码 vs 同步解码
-        if args.async_decode:
-            iter_source = dataset.decode_iter(loader)
-        else:
-            iter_source = loader
-
-        for batch_idx, items_or_decoded in enumerate(iter_source):
-            if args.worker_decode:
-                # worker_decode 模式：帧已在 worker 中解码，直接 collate
-                batch = decode_and_collate(items_or_decoded, dataset)
-            elif args.async_decode:
-                # decode_iter 已经在后台线程中解码完成
-                batch = decode_and_collate(items_or_decoded, dataset)
-            else:
-                # 同步模式：在主进程中解码视频并 collate
-                batch = decode_and_collate(items_or_decoded, dataset)
+        for batch_idx, batch in enumerate(async_loader):
             batch_count += 1
             bs = None
             for key in batch:
@@ -683,10 +626,6 @@ def main():
             for e in errors_in_iteration:
                 result.fail(f"迭代中出错: {e}")
 
-        # 清理异步解码管线
-        if args.async_decode:
-            dataset.shutdown_decode_pipeline()
-
     except Exception as e:
         result.fail(f"多批次遍历失败: {e}")
         traceback.print_exc()
@@ -713,18 +652,23 @@ def main():
             seed=args.streaming_seed,
             shuffle=False if args.no_shuffle else True,
             decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
             async_decode=False,  # 单条样本不需要异步管线
-            worker_decode=False,  # 单条样本不需要 worker 解码
+            deferred_video_decode=not args.no_deferred,
         )
 
-        single_loader = DataLoader(
+        single_raw_loader = DataLoader(
             dataset,
             batch_size=1,
             num_workers=0,
-            collate_fn=make_passthrough_collate(),
+            collate_fn=lambda x: x,
         )
-        items = next(iter(single_loader))
-        sample_batch = decode_and_collate(items, dataset)
+        single_loader = AsyncDecodeDataLoader(
+            dataloader=single_raw_loader,
+            dataset=dataset,
+            collate_fn=AsyncDecodeDataLoader.make_collate_fn(),
+        )
+        sample_batch = next(iter(single_loader))
         result.ok("单条样本成功获取")
 
         # 确定预期 key
@@ -845,7 +789,7 @@ def main():
             "hist_actions_length": torch.tensor(30, dtype=torch.long),
             "task": "pick_place",
         }
-        collated = decode_and_collate([fake_item_1, fake_item_2], dataset)
+        collated = AsyncDecodeDataLoader.make_collate_fn()([fake_item_1, fake_item_2])
         result.ok("collate_fn 对变长 hist_actions_full/hist_actions_mask 能正常工作")
 
         # 验证 padding 后长度一致
