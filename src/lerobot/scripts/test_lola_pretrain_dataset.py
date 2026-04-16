@@ -44,7 +44,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig
 
 
-def test_basic_loading(dataset_root, dataset_to_episodes_path=None):
+def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=None):
     """测试 1: 基本数据集加载"""
     print("\n" + "=" * 60)
     print("Test 1: Basic Dataset Loading")
@@ -78,6 +78,7 @@ def test_basic_loading(dataset_root, dataset_to_episodes_path=None):
         max_history_length=10,
         action_chunk_size=config.action_chunk_size,
         root=dataset_root,
+        sub_root=sub_root,
         delta_timestamps=delta_timestamps,
         streaming=True,
         buffer_size=10,
@@ -360,7 +361,7 @@ def test_collate(dataset, batch_size=3):
     print("  PASSED")
 
 
-def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None):
+def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None, sub_root=None):
     """测试 6: Lightweight (deferred decode) 模式"""
     print("\n" + "=" * 60)
     print("Test 6: Lightweight / Deferred Decode Mode")
@@ -394,6 +395,7 @@ def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None):
         max_history_length=10,
         action_chunk_size=config.action_chunk_size,
         root=dataset_root,
+        sub_root=sub_root,
         delta_timestamps=delta_timestamps,
         streaming=True,
         buffer_size=10,
@@ -448,10 +450,13 @@ def main():
                         help="每个测试最多迭代的 item 数")
     parser.add_argument("--skip_collate", action="store_true",
                         help="跳过 collate 测试（耗时较长）")
+    parser.add_argument("--sub_root", type=str, required=True,
+                        help="子数据集根目录（合并数据集）")
 
     args = parser.parse_args()
 
     dataset_to_episodes_path = args.dataset_to_episodes_path
+    sub_root = args.sub_root
     if args.no_mapping:
         dataset_to_episodes_path = None
 
