@@ -636,16 +636,17 @@ def _load_episodes_polars(root) -> list[dict]:
     for path in parquet_files:
         df = pl.scan_parquet(str(path)).collect()
         if df.height > 0:
-            dfs.append(df)
+            # Drop stats/ columns before concat to avoid type mismatch
+            # (e.g. stats/frame_index/min may be List(Int64) in some files
+            # and List(Float64) in others, which prevents diagonal concat).
+            # These columns are not needed (same as original load_episodes behavior).
+            non_stats_cols = [c for c in df.columns if not c.startswith("stats/")]
+            dfs.append(df.select(non_stats_cols))
 
     if not dfs:
         return []
 
     combined = pl.concat(dfs, how="diagonal")
-
-    # Drop stats/ columns (same as original load_episodes behavior)
-    non_stats_cols = [c for c in combined.columns if not c.startswith("stats/")]
-    combined = combined.select(non_stats_cols)
 
     # Sort by episode_index and convert to list of dicts
     combined = combined.sort("episode_index")
