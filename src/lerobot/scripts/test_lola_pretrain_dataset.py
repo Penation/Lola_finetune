@@ -472,23 +472,39 @@ def main():
     print(f"Dataset-to-episodes path: {dataset_to_episodes_path}")
 
     # Test 1: Basic loading
+    time_start = time.time()
     dataset = test_basic_loading(args.dataset_root, dataset_to_episodes_path, sub_root)
+    time_stage_1 = time.time()
+    print(f"Dataset loading time: {time_stage_1 - time_start:.3f} seconds")
 
     # Test 2: Iteration & item structure
     items = test_iteration(dataset, max_items=args.max_items)
+    time_stage_2 = time.time()
+    print(f"Dataset iteration time: {time_stage_2 - time_stage_1:.3f} seconds")
 
     # Test 3: Per-sub-dataset normalization
     test_normalization(items, dataset)
+    time_stage_3 = time.time()
+    print(f"Dataset normalization time: {time_stage_3 - time_stage_2:.3f} seconds")
 
     # Test 4: Camera is_valid
     test_camera_valid_mask(items, dataset)
+    time_stage_4 = time.time()
+    print(f"Dataset camera is_valid time: {time_stage_4 - time_stage_3:.3f} seconds")
 
     # Test 5: Dynamic resolution collate
     if not args.skip_collate:
         test_collate(dataset, batch_size=3)
+        time_stage_5 = time.time()
+        print(f"Dataset collate time: {time_stage_5 - time_stage_4:.3f} seconds")
 
     # Test 6: Lightweight mode
     test_lightweight_mode(args.dataset_root, dataset_to_episodes_path, sub_root)
+    time_stage_6 = time.time()
+    if not args.skip_collate:
+        print(f"Dataset lightweight mode time: {time_stage_6 - time_stage_5:.3f} seconds")
+    else:
+        print(f"Dataset lightweight mode time: {time_stage_6 - time_stage_4:.3f} seconds")
 
     print("\n" + "=" * 60)
     print("All tests completed!")
