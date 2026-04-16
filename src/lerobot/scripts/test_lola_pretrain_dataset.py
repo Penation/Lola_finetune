@@ -106,12 +106,24 @@ def test_iteration(dataset, max_items=5):
     print("=" * 60)
 
     items = []
+    t_start = time.monotonic()
     for i, item in enumerate(dataset):
         if i >= max_items:
             break
         items.append(item)
-
-    print(f"  Collected {len(items)} items")
+        elapsed = time.monotonic() - t_start
+        done = i + 1
+        avg = elapsed / done
+        eta = avg * (max_items - done)
+        print(
+            f"\r  Iterating: {done}/{max_items} | "
+            f"elapsed: {elapsed:.1f}s | avg: {avg:.2f}s/item | "
+            f"ETA: {eta:.1f}s",
+            end="", flush=True,
+        )
+    elapsed = time.monotonic() - t_start
+    avg = elapsed / len(items) if items else 0
+    print(f"\r  Collected {len(items)} items in {elapsed:.1f}s ({avg:.2f}s/item)" + " " * 20)
 
     if len(items) == 0:
         print("  WARNING: No items collected!")
