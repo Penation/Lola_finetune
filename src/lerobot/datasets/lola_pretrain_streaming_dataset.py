@@ -625,6 +625,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         action_chunk_size: int = 10,
         history_padding_side: str = "left",
         root: str | None = None,
+        sub_root: str | None = None,
         episodes: list[int] | None = None,
         image_transforms=None,
         delta_timestamps: dict[str, list[float]] | None = None,
@@ -651,6 +652,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             action_chunk_size: action 块大小，历史长度补齐到该值的整数倍
             history_padding_side: padding 方向，"left" 或 "right"
             root: 本地数据集根目录（挂载路径）
+            sub_root: 子数据集目录
             episodes: 指定加载的 episode 列表
             image_transforms: 图像变换（预训练模式下不使用，由 Qwen3.5 processor 处理）
             delta_timestamps: 时间戳偏移配置
@@ -689,6 +691,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
 
         self.repo_id = repo_id
         self.root = __import__("pathlib").Path(root) if root else HF_LEROBOT_HOME / repo_id
+        self.sub_root = sub_root
         self.streaming_from_local = root is not None
 
         self.image_transforms = image_transforms
@@ -789,7 +792,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             self._sub_dataset_paths.append(ds_path)
 
             # Load per-sub-dataset stats
-            stats_path = os.path.join(str(self.root), ds_path, "meta", "stats.json")
+            stats_path = os.path.join(str(self.sub_root), ds_path, "meta", "stats.json")
             norm_params = None
             action_dim = self.action_dim
             state_dim = 0
@@ -827,8 +830,32 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             self._sub_dataset_dims.append((action_dim, state_dim))
             ds_idx += 1
 
+    @staticmethod
+    def _make_translation_norm_mask(action_dim: int) -> torch.Tensor:
+        """构建 action 维度的归一化 mask: 仅平移维度需要归一化。
+
+        动作空间结构:
+        - 单臂 (10 dim): dim 0-2 为平移(x,y,z), dim 3-8 为 orth6D, dim 9 为夹爪
+        - 双臂 (20 dim): dim 0-2 为臂1平移, dim 10-12 为臂2平移, 其余无需归一化
+        - orth6D 旋转和夹爪状态天然在 [-1, 1] 范围内, 不需归一化
+
+        Returns:
+            BoolTensor [action_dim], True 表示该维度需要归一化
+        """
+        mask = torch.zeros(action_dim, dtype=torch.bool)
+        arm_dim = 10  # 单臂动作维度
+        num_arms = action_dim // arm_dim
+        for arm in range(num_arms):
+            offset = arm * arm_dim
+            mask[offset:offset + 3] = True  # 平移 (x, y, z)
+        return mask
+
     def _normalize_per_subdataset(self, item):
-        """Per-sub-dataset normalization for observation.state, action, and hist_actions_full."""
+        """Per-sub-dataset normalization for observation.state, action, and hist_actions_full.
+
+        仅对平移维度 (每臂 dim 0-2) 进行 mean/std 归一化,
+        orth6D 旋转和夹爪状态天然在 [-1, 1] 范围内, 不需归一化。
+        """
         ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
         if ep_idx >= len(self._episode_to_ds_idx) or self._episode_to_ds_idx[ep_idx] < 0:
             return item  # Unknown sub-dataset, skip normalization
@@ -844,18 +871,25 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             mean, std = stats["observation.state"]["mean"], stats["observation.state"]["std"]
             item["observation.state"] = (item["observation.state"] - mean) / (std + 1e-8)
 
-        # action
+        # action: 仅归一化平移维度
         if "action" in item and "action" in stats:
             mean, std = stats["action"]["mean"], stats["action"]["std"]
-            item["action"] = (item["action"] - mean) / (std + 1e-8)
+            norm_mask = self._make_translation_norm_mask(mean.shape[0])
+            action = item["action"]
+            normalized = (action - mean) / (std + 1e-8)
+            item["action"] = torch.where(norm_mask, normalized, action)
 
-        # hist_actions_full (only normalize mask=True parts, keep padding as 0)
+        # hist_actions_full: 仅归一化平移维度 (mask=True 部分)
         if "hist_actions_full" in item and "action" in stats:
             mean, std = stats["action"]["mean"], stats["action"]["std"]
+            norm_mask = self._make_translation_norm_mask(mean.shape[0])
             mask = item["hist_actions_mask"]  # [SeqLen]
             normalized = (item["hist_actions_full"] - mean) / (std + 1e-8)
+            # 只对 padding mask=True 且 translation dim 的位置进行归一化
             mask_expanded = mask.unsqueeze(-1).expand_as(normalized)
-            item["hist_actions_full"] = torch.where(mask_expanded, normalized, item["hist_actions_full"])
+            norm_mask_expanded = norm_mask.unsqueeze(0).expand_as(normalized)
+            should_normalize = mask_expanded & norm_mask_expanded
+            item["hist_actions_full"] = torch.where(should_normalize, normalized, item["hist_actions_full"])
 
         return item
 
@@ -1785,7 +1819,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return query_result, padding
 
     def _add_history_actions(self, item, dataset_iterator):
-        """为当前帧添加完整历史 action。"""
+        """为当前帧添加完整历史 action。
+
+        优化：使用单次 history() 调用替代 1023 次 peek_back + item_to_torch，
+        仅提取 episode_index 和 action 字段，在 episode 边界处提前终止。
+        """
         current_episode_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
 
         current_action = item.get("action")
@@ -1795,36 +1833,47 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         if current_action.dim() > 1:
             current_action = current_action[0] if current_action.shape[0] == 1 else current_action[-1]
 
+        # 单次获取整个历史缓冲区，替代逐个 peek_back 调用
+        hist = dataset_iterator.history()  # 按时间顺序 (oldest first)
+
         past_actions = []
         past_masks = []
 
-        max_lookback = min(self.max_history_length - 1, len(dataset_iterator.history()))
+        # 从最近的历史项向前遍历，遇到 episode 边界即终止
+        # 因为 episode 是连续的，一旦找到不同 episode 的项，更早的项也属于不同 episode
+        for i in range(len(hist) - 1, -1, -1):
+            if len(past_actions) >= self.max_history_length - 1:
+                break
 
-        for steps_back in range(max_lookback, 0, -1):
-            try:
-                if dataset_iterator.can_peek_back(steps_back):
-                    past_item = dataset_iterator.peek_back(steps_back)
-                    past_item = item_to_torch(past_item)
+            past_item = hist[i]
 
-                    if past_item["episode_index"] == current_episode_idx:
-                        past_action = past_item.get("action")
-                        if past_action is not None:
-                            if past_action.dim() > 1:
-                                past_action = past_action[0] if past_action.shape[0] == 1 else past_action[-1]
-                            past_actions.append(past_action)
-                            past_masks.append(True)
-                        else:
-                            past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                            past_masks.append(False)
-                    else:
-                        past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                        past_masks.append(False)
-                else:
-                    past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                    past_masks.append(False)
-            except Exception:
+            # 仅提取 episode_index（最小化转换）
+            ep_idx = past_item.get("episode_index")
+            if isinstance(ep_idx, (np.ndarray, list)):
+                ep_idx = torch.tensor(ep_idx)
+                past_item["episode_index"] = ep_idx  # 缓存转换结果
+            ep_val = ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
+
+            if ep_val != current_episode_idx:
+                break  # Episode 边界，更早的项也属于不同 episode，提前终止
+
+            # 仅提取 action 字段（最小化转换）
+            past_action = past_item.get("action")
+            if past_action is not None:
+                if isinstance(past_action, (np.ndarray, list)):
+                    past_action = torch.tensor(past_action)
+                    past_item["action"] = past_action  # 缓存转换结果
+                if past_action.dim() > 1:
+                    past_action = past_action[0] if past_action.shape[0] == 1 else past_action[-1]
+                past_actions.append(past_action)
+                past_masks.append(True)
+            else:
                 past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
                 past_masks.append(False)
+
+        # 反转为时间顺序 (oldest first)
+        past_actions.reverse()
+        past_masks.reverse()
 
         past_actions.append(current_action)
         past_masks.append(True)
