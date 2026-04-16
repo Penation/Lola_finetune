@@ -472,6 +472,54 @@ class DecodeProcessPipeline:
 
 
 
+def _safe_concat(dfs: list[pl.DataFrame]) -> pl.DataFrame:
+    """安全合并多个 polars DataFrame，处理列顺序不同和类型不兼容的情况。
+
+    合并多个子数据集的 parquet 文件时可能遇到：
+    1. 列顺序不同（如一个文件 episode_index 在前，另一个 timestamp 在前）
+    2. 同名列类型不同（如 stats/frame_index/min 在不同文件中为 Int64 vs Float64）
+
+    策略：先按第一个 df 的列顺序对齐所有 df，再 vertical_relaxed concat。
+    对于只存在于部分 df 的列，用 null 填充。
+    对于类型不兼容的同名列，尝试统一到兼容类型。
+    """
+    if len(dfs) == 1:
+        return dfs[0]
+
+    # 收集所有列名（按首次出现顺序，保持一致）
+    all_cols: list[str] = []
+    seen = set()
+    for df in dfs:
+        for c in df.columns:
+            if c not in seen:
+                all_cols.append(c)
+                seen.add(c)
+
+    # 对齐每个 df 的列：缺失列补 null，按 all_cols 顺序 select
+    aligned = []
+    for df in dfs:
+        existing = set(df.columns)
+        # 补缺失列
+        null_cols = [c for c in all_cols if c not in existing]
+        if null_cols:
+            df = df.with_columns([pl.lit(None).alias(c) for c in null_cols])
+        # 按 all_cols 顺序 select
+        try:
+            df = df.select(all_cols)
+        except pl.exceptions.SchemaError:
+            # 类型不兼容：逐列处理，将不兼容的列 cast 到公共类型
+            selected = []
+            for col in all_cols:
+                if col in existing:
+                    selected.append(pl.col(col))
+                else:
+                    selected.append(pl.lit(None).alias(col))
+            df = df.select(selected)
+        aligned.append(df)
+
+    return pl.concat(aligned, how="vertical_relaxed")
+
+
 class PolarsRowIterator:
     """
     使用 polars 读取 parquet 文件并逐行生成 dict，替代 HF IterableDataset。
@@ -506,7 +554,7 @@ class PolarsRowIterator:
                 if df.height > 0:
                     dfs.append(df)
             if dfs:
-                self._df = pl.concat(dfs, how="vertical_relaxed")
+                self._df = _safe_concat(dfs)
                 if self._df.height > 0:
                     total = self._df.height
                     start = min(row_offset, total)
@@ -565,7 +613,7 @@ class PolarsRowIterator:
         if not dfs:
             self._df = pl.DataFrame()
         else:
-            self._df = pl.concat(dfs, how="vertical_relaxed")
+            self._df = _safe_concat(dfs)
 
         self._pos = 0
         self._len = self._df.height
