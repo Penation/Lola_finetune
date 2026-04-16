@@ -824,8 +824,8 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         # 当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含不同的列
         # （因为不同子数据集有不同的 camera keys），导致 HF datasets 的
         # Dataset.from_parquet() 在统一 schema 时报 CastError。
-        # 使用 polars 的 vertical_relaxed 策略安全合并，缺失列自动填充 null。
-        self.meta = self._load_metadata_polars(
+        # 直接使用 polars diagonal concat 安全合并，缺失列自动填充 null。
+        self.meta = self._build_metadata_polars(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
@@ -872,72 +872,58 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         print(f"[LoLAPretrainStreamingDataset] sub_datasets: {len(self._sub_dataset_names)}")
 
     @staticmethod
-    def _load_metadata_polars(repo_id, root, revision, force_cache_sync=False):
-        """加载元数据，使用 polars 加载 episodes 以避免 HF datasets CastError。
+    def _build_metadata_polars(repo_id, root, revision, force_cache_sync=False):
+        """构建元数据对象，使用 polars 加载 episodes 以避免 HF datasets CastError。
 
         当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含
         不同的列（因为不同子数据集有不同的 camera keys），导致 HF datasets
         的 Dataset.from_parquet() 在统一 schema 时报 CastError:
         "column names don't match"。
 
-        此方法先尝试使用标准 LeRobotDatasetMetadata 加载，如果 episodes
-        加载失败，则手动加载 info/tasks/stats 并用 polars 加载 episodes。
+        此方法直接使用 polars 加载 episodes，避免触发 HF datasets 的 schema
+        统一逻辑。其余元数据（info, tasks, stats）使用标准加载函数。
 
         Returns:
             LeRobotDatasetMetadata 实例（episodes 替换为 _EpisodeAccessor）
         """
-        try:
-            meta = LeRobotDatasetMetadata(
-                repo_id, root, revision, force_cache_sync=force_cache_sync
+        from pathlib import Path
+
+        meta_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+        _revision = revision if revision else CODEBASE_VERSION
+
+        if force_cache_sync:
+            from lerobot.datasets.lerobot_dataset import is_valid_version, get_safe_version
+            if is_valid_version(_revision):
+                _revision = get_safe_version(repo_id, _revision)
+            (meta_root / "meta").mkdir(exist_ok=True, parents=True)
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id, repo_type="dataset", revision=_revision,
+                local_dir=meta_root, allow_patterns="meta/",
             )
-            return meta
-        except Exception as e:
-            err_msg = str(e)
-            if "column names don't match" not in err_msg and "CastError" not in err_msg:
-                raise  # Not the expected error, re-raise
 
-            logger.warning(
-                f"[LoLAPretrainStreamingDataset] HF datasets CastError when loading episodes: {e}. "
-                f"Falling back to polars-based episodes loading."
-            )
+        # 手动构建 metadata 对象，避免触发 LeRobotDatasetMetadata.__init__
+        # 中的 load_metadata() -> load_episodes() -> Dataset.from_parquet() 路径
+        meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+        meta.repo_id = repo_id
+        meta.revision = _revision
+        meta.root = meta_root
+        meta.writer = None
+        meta.latest_episode = None
+        meta.metadata_buffer = []
+        meta.metadata_buffer_size = 10
 
-            # 手动加载元数据组件
-            from pathlib import Path
-            meta_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
-            _revision = revision if revision else CODEBASE_VERSION
+        # 使用标准函数加载 info/tasks/stats（不涉及 HF datasets schema 统一）
+        meta.info = load_info(meta_root)
+        meta.tasks = load_tasks(meta_root)
+        meta.stats = load_stats(meta_root)
 
-            if force_cache_sync:
-                from lerobot.datasets.lerobot_dataset import is_valid_version, get_safe_version
-                if is_valid_version(_revision):
-                    _revision = get_safe_version(repo_id, _revision)
-                (meta_root / "meta").mkdir(exist_ok=True, parents=True)
-                from huggingface_hub import snapshot_download
-                snapshot_download(
-                    repo_id, repo_type="dataset", revision=_revision,
-                    local_dir=meta_root, allow_patterns="meta/",
-                )
+        # 使用 polars 加载 episodes（避免 HF datasets CastError）
+        episodes_list = _load_episodes_polars(meta_root)
+        meta.episodes = _EpisodeAccessor(episodes_list)
 
-            # 手动构建 metadata 对象，避免再次触发 load_episodes
-            meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
-            meta.repo_id = repo_id
-            meta.revision = _revision
-            meta.root = meta_root
-            meta.writer = None
-            meta.latest_episode = None
-            meta.metadata_buffer = []
-            meta.metadata_buffer_size = 10
-
-            meta.info = load_info(meta_root)
-            meta.tasks = load_tasks(meta_root)
-            meta.stats = load_stats(meta_root)
-
-            # 使用 polars 加载 episodes
-            episodes_list = _load_episodes_polars(meta_root)
-            meta.episodes = _EpisodeAccessor(episodes_list)
-
-            print(f"[LoLAPretrainStreamingDataset] Loaded {len(episodes_list)} episodes via polars "
-                  f"(HF datasets CastError fallback)")
-            return meta
+        print(f"[LoLAPretrainStreamingDataset] Loaded {len(episodes_list)} episodes via polars")
+        return meta
 
     def _load_dataset_to_episodes(self, dataset_to_episodes_path: str):
         """Load dataset_to_episodes.json and build per-sub-dataset normalization data.
