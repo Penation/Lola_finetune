@@ -467,7 +467,7 @@ def main():
     print(f"Dataset-to-episodes path: {dataset_to_episodes_path}")
 
     # Test 1: Basic loading
-    dataset = test_basic_loading(args.dataset_root, dataset_to_episodes_path)
+    dataset = test_basic_loading(args.dataset_root, dataset_to_episodes_path, sub_root)
 
     # Test 2: Iteration & item structure
     items = test_iteration(dataset, max_items=args.max_items)
@@ -483,7 +483,7 @@ def main():
         test_collate(dataset, batch_size=3)
 
     # Test 6: Lightweight mode
-    test_lightweight_mode(args.dataset_root, dataset_to_episodes_path)
+    test_lightweight_mode(args.dataset_root, dataset_to_episodes_path, sub_root)
 
     print("\n" + "=" * 60)
     print("All tests completed!")
