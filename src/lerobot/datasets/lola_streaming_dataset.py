@@ -1544,7 +1544,11 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         return query_result, padding
 
     def _add_history_actions(self, item, dataset_iterator):
-        """为当前帧添加完整历史 action。"""
+        """为当前帧添加完整历史 action。
+
+        优化：使用单次 history() 调用替代 1023 次 peek_back + item_to_torch，
+        仅提取 episode_index 和 action 字段，在 episode 边界处提前终止。
+        """
         current_episode_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
 
         current_action = item.get("action")
@@ -1554,36 +1558,47 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         if current_action.dim() > 1:
             current_action = current_action[0] if current_action.shape[0] == 1 else current_action[-1]
 
+        # 单次获取整个历史缓冲区，替代逐个 peek_back 调用
+        hist = dataset_iterator.history()  # 按时间顺序 (oldest first)
+
         past_actions = []
         past_masks = []
 
-        max_lookback = min(self.max_history_length - 1, len(dataset_iterator.history()))
+        # 从最近的历史项向前遍历，遇到 episode 边界即终止
+        # 因为 episode 是连续的，一旦找到不同 episode 的项，更早的项也属于不同 episode
+        for i in range(len(hist) - 1, -1, -1):
+            if len(past_actions) >= self.max_history_length - 1:
+                break
 
-        for steps_back in range(max_lookback, 0, -1):
-            try:
-                if dataset_iterator.can_peek_back(steps_back):
-                    past_item = dataset_iterator.peek_back(steps_back)
-                    past_item = item_to_torch(past_item)
+            past_item = hist[i]
 
-                    if past_item["episode_index"] == current_episode_idx:
-                        past_action = past_item.get("action")
-                        if past_action is not None:
-                            if past_action.dim() > 1:
-                                past_action = past_action[0] if past_action.shape[0] == 1 else past_action[-1]
-                            past_actions.append(past_action)
-                            past_masks.append(True)
-                        else:
-                            past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                            past_masks.append(False)
-                    else:
-                        past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                        past_masks.append(False)
-                else:
-                    past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
-                    past_masks.append(False)
-            except Exception:
+            # 仅提取 episode_index（最小化转换）
+            ep_idx = past_item.get("episode_index")
+            if isinstance(ep_idx, (np.ndarray, list)):
+                ep_idx = torch.tensor(ep_idx)
+                past_item["episode_index"] = ep_idx  # 缓存转换结果
+            ep_val = ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
+
+            if ep_val != current_episode_idx:
+                break  # Episode 边界，更早的项也属于不同 episode，提前终止
+
+            # 仅提取 action 字段（最小化转换）
+            past_action = past_item.get("action")
+            if past_action is not None:
+                if isinstance(past_action, (np.ndarray, list)):
+                    past_action = torch.tensor(past_action)
+                    past_item["action"] = past_action  # 缓存转换结果
+                if past_action.dim() > 1:
+                    past_action = past_action[0] if past_action.shape[0] == 1 else past_action[-1]
+                past_actions.append(past_action)
+                past_masks.append(True)
+            else:
                 past_actions.append(torch.zeros(self.action_dim, dtype=current_action.dtype))
                 past_masks.append(False)
+
+        # 反转为时间顺序 (oldest first)
+        past_actions.reverse()
+        past_masks.reverse()
 
         past_actions.append(current_action)
         past_masks.append(True)

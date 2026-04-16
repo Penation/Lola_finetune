@@ -102,18 +102,17 @@ class LolaVLMFeatureExtractor(nn.Module):
         self.empty_token_shortcut = nn.Linear(concat_dim, config.dit_hidden_size)
         self.empty_token_out_proj = nn.Linear(config.dit_hidden_size, config.dit_hidden_size)
 
-    def forward(self, hidden_states_all_layers: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, hidden_states_all_layers: Dict[int, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            hidden_states_all_layers: VLM 前向传播 output_hidden_states=True 返回的元组
-                结构: [embedding层输出, transformer层1输出, transformer层2输出, ...]
-                对于 Qwen3.5-4B: 共 33 层 (1 embedding + 32 transformer layers)
-        
+            hidden_states_all_layers: Dict[int, Tensor] 仅包含所需层的 hidden_states
+                通过 forward hook 捕获，key 为层编号 (如 8, 16, 24)
+
         Returns:
             vlm_emb: [B, Seq_Len-1, dit_hidden_size] - VLM 特征（不包含最后一个 token）
             empty_emb: [B, dit_hidden_size] - 空 token 特征（最后一个 token）
         """
-        # 提取指定的 transformer 层 
+        # 提取指定的 transformer 层
         selected_hiddens = [hidden_states_all_layers[i] for i in self.extract_layers]
         stacked_features = torch.cat(selected_hiddens, dim=-1) # [B, SeqLen, 7680]
         
@@ -675,7 +674,43 @@ class LoLAPolicy(PreTrainedPolicy):
 
         # 初始化动作队列
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
-    
+
+        # VLM forward hooks: 仅捕获需要的层 (8, 16, 24)，替代 output_hidden_states=True
+        self._captured_hidden_states: Dict[int, torch.Tensor] = {}
+        self._hook_handles: List = []
+        self._in_vlm_forward: bool = False
+        self._register_vlm_hooks()
+
+    def _register_vlm_hooks(self):
+        """在 VLM 的指定 decoder 层上注册 forward hook，仅捕获所需的 hidden states。
+
+        替代 output_hidden_states=True（会物化所有 33 层），仅在需要的 3 层上
+        注册 hook，减少 30 个无用张量的分配和内存压力。
+
+        层索引映射: hidden_states[8] = layers[7] 的输出 (因为 hidden_states[0] 是 embedding)
+        """
+        for extract_layer_idx in self.config.vlm_extract_layers:
+            decoder_layer_idx = extract_layer_idx - 1
+            decoder_layer = self.vlm.model.language_model.layers[decoder_layer_idx]
+
+            def make_hook(eidx):
+                def hook_fn(module, input, output):
+                    if not self._in_vlm_forward:
+                        return
+                    # Qwen3_5DecoderLayer.forward() 返回单个 tensor (非 tuple)
+                    self._captured_hidden_states[eidx] = output
+                return hook_fn
+
+            handle = decoder_layer.register_forward_hook(make_hook(extract_layer_idx))
+            self._hook_handles.append(handle)
+
+    def _remove_vlm_hooks(self):
+        """移除所有 VLM forward hooks并清理状态。"""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+        self._captured_hidden_states = {}
+
     def _move_to_device(self, device: torch.device):
         """将模型移动到指定设备（供 Lightning 策略调用）"""
         self._device = device
@@ -779,13 +814,13 @@ class LoLAPolicy(PreTrainedPolicy):
             actions = actions.unsqueeze(1)
         return actions
 
-    def prepare_vlm_inputs(self, batch: Dict[str, torch.Tensor]) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+    def prepare_vlm_inputs(self, batch: Dict[str, torch.Tensor]) -> Tuple[Dict[int, torch.Tensor], torch.Tensor]:
         """
         处理和准备 VLM (Qwen3.5) 的输入特征。
-        
-        调用 Qwen3.5ForConditionalGeneration 前向传播，获取指定层的 hidden_states。
-        LoLA 提取 Qwen3.5 第 8, 16, 24 层的隐藏状态进行多层级特征融合。
-        
+
+        通过 forward hook 仅捕获指定层 (8, 16, 24) 的 hidden_states，
+        替代 output_hidden_states=True（会物化所有 33 层但只使用 3 层）。
+
         Args:
             batch: 包含输入数据的字典，可能包含以下键:
                 - "input_ids": 文本 token IDs [B, seq_len]
@@ -793,9 +828,9 @@ class LoLAPolicy(PreTrainedPolicy):
                 - "pixel_values": 图像像素值 (用于视觉输入)
                 - "image_grid_thw": 图像网格信息 (Qwen3.5 视觉模型需要)
                 - "attention_mask": 注意力掩码
-                
+
         Returns:
-            hidden_states_all_layers: 所有层的 hidden_states 元组
+            hidden_states_all_layers: Dict[int, Tensor] 仅包含所需层的 hidden_states
             input_ids: 输入 token IDs
         """
         # 1. 提取 input_ids
@@ -812,20 +847,24 @@ class LoLAPolicy(PreTrainedPolicy):
         pixel_values = batch.get("pixel_values", None)
         image_grid_thw = batch.get("image_grid_thw", None)
         attention_mask = batch.get("attention_mask", None)
-        
+
         # 3. 调用 Qwen3.5 获取 hidden_states
         # 如果 batch 中已经提供了预计算的 hidden_states，直接使用
         if "hidden_states_all_layers" in batch:
-            hidden_states_all_layers = batch["hidden_states_all_layers"]
+            raw = batch["hidden_states_all_layers"]
+            if isinstance(raw, dict):
+                hidden_states_all_layers = raw
+            else:
+                # Legacy tuple format: 仅提取所需层，转为 dict
+                hidden_states_all_layers = {i: raw[i] for i in self.config.vlm_extract_layers}
         else:
-            # 端到端调用 Qwen3.5 模型
-            # 构建 forward 参数
+            # 端到端调用 Qwen3.5 模型，仅通过 hook 捕获所需层
             forward_kwargs = {
                 "input_ids": input_ids,
-                "output_hidden_states": True,  # 输出所有层的 hidden_states
+                "output_hidden_states": False,  # 不物化所有 33 层，改用 hook 捕获
                 "return_dict": True,
             }
-            
+
             # 添加视觉输入（如果有）
             if pixel_values is not None:
                 forward_kwargs["pixel_values"] = pixel_values
@@ -833,21 +872,21 @@ class LoLAPolicy(PreTrainedPolicy):
                 forward_kwargs["image_grid_thw"] = image_grid_thw
             if attention_mask is not None:
                 forward_kwargs["attention_mask"] = attention_mask
-            
-            # 调用 VLM 前向传播
-            # Qwen3_5ForConditionalGeneration.forward() 返回 Qwen3_5CausalLMOutputWithPast
-            # 注意：如果需要训练 VLM，需要启用梯度计算
-            if not self.config.train_vlm:
-                with torch.no_grad():  # VLM 前向传播不需要梯度（当 train_vlm=False）
-                    vlm_outputs = self.vlm(**forward_kwargs)
-            else:
-                # 训练 VLM 时启用梯度
-                vlm_outputs = self.vlm(**forward_kwargs)
-            
-            # hidden_states 是一个元组，包含 embedding 层 + 所有 transformer 层的输出
-            # 对于 Qwen3.5-4B: 共 33 层 (1 embedding + 32 transformer layers)
-            hidden_states_all_layers = vlm_outputs.hidden_states
-            
+
+            # 激活 hook 捕获
+            self._captured_hidden_states = {}
+            self._in_vlm_forward = True
+            try:
+                if not self.config.train_vlm:
+                    with torch.no_grad():
+                        self.vlm(**forward_kwargs)
+                else:
+                    self.vlm(**forward_kwargs)
+            finally:
+                self._in_vlm_forward = False
+
+            hidden_states_all_layers = self._captured_hidden_states
+
         return hidden_states_all_layers, input_ids
 
     # =========================================================
@@ -865,7 +904,7 @@ class LoLAPolicy(PreTrainedPolicy):
         if hist_actions_mask is not None:
             hist_actions_mask = hist_actions_mask.to(self.dtype)
         # 将 hidden_states_all_layers 也转换为正确的 dtype (解决 BF16 训练时的 dtype 不匹配问题)
-        hidden_states_all_layers = tuple(h.to(self.dtype) for h in hidden_states_all_layers)
+        hidden_states_all_layers = {k: v.to(self.dtype) for k, v in hidden_states_all_layers.items()}
 
         losses = self.model(
             hidden_states_all_layers=hidden_states_all_layers,
