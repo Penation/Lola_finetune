@@ -169,7 +169,7 @@ def create_lola_pretrain_streaming_dataset(
     dataset_to_episodes_path: str | None = None,
 ):
     """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
-    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id, root=root, revision=None)
     fps = dataset_metadata.fps
 
     delta_timestamps = {}
@@ -298,9 +298,10 @@ def main():
 
     # 获取数据集元数据
     logger.info("Loading dataset metadata...")
-    dataset_metadata = LeRobotDatasetMetadata(
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(
         args.dataset_repo_id,
         root=args.dataset_root,
+        revision=None,
     )
 
     features = dataset_to_policy_features(dataset_metadata.features)

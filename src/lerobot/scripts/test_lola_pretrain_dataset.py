@@ -38,7 +38,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from lerobot.configs.types import FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset, AsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig
@@ -50,7 +49,10 @@ def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=Non
     print("Test 1: Basic Dataset Loading")
     print("=" * 60)
 
-    dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+    # 使用 polars 加载元数据（避免 HF datasets CastError）
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(
+        repo_id="test", root=dataset_root, revision=None
+    )
     fps = dataset_metadata.fps
     features = dataset_to_policy_features(dataset_metadata.features)
     action_dim = features["action"].shape[0] if "action" in features else 20
@@ -367,7 +369,10 @@ def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None, sub_root=
     print("Test 6: Lightweight / Deferred Decode Mode")
     print("=" * 60)
 
-    dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+    # 使用 polars 加载元数据（避免 HF datasets CastError）
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(
+        repo_id="test", root=dataset_root, revision=None
+    )
     fps = dataset_metadata.fps
     features = dataset_to_policy_features(dataset_metadata.features)
     action_dim = features["action"].shape[0] if "action" in features else 20

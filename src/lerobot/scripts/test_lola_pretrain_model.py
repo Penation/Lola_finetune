@@ -43,7 +43,6 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from lerobot.configs.types import FeatureType, NormalizationMode
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset, AsyncDecodeDataLoader
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig
@@ -63,7 +62,7 @@ def get_vlm_path():
 
 def create_config(dataset_root, vlm_path=None, action_dim=20):
     """创建 LoLAConfig"""
-    dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id="test", root=dataset_root, revision=None)
     fps = dataset_metadata.fps
     features = dataset_to_policy_features(dataset_metadata.features)
     if "action" in features:
@@ -96,7 +95,7 @@ def create_dataset(dataset_root, dataset_to_episodes_path, config, fps, batch_si
     delta_timestamps["observation.state"] = [i / fps for i in config.observation_delta_indices]
     delta_timestamps["action"] = [i / fps for i in config.action_delta_indices]
 
-    dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id="test", root=dataset_root, revision=None)
     for key in dataset_metadata.camera_keys:
         delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
 
@@ -310,7 +309,7 @@ def test_processor_with_real_data(dataset_root, dataset_to_episodes_path, config
     print(f"  Batch keys: {sorted(batch.keys())}")
 
     # 检查 camera key 格式
-    dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+    dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id="test", root=dataset_root, revision=None)
     cam_keys = dataset_metadata.camera_keys
     for cam_key in cam_keys:
         if cam_key in batch:
@@ -572,7 +571,7 @@ def test_end_to_end(dataset_root, dataset_to_episodes_path, config, fps, batch_s
         policy.vlm = policy.vlm.to(device)
         policy.model.train()
 
-        dataset_metadata = LeRobotDatasetMetadata(repo_id="test", root=dataset_root)
+        dataset_metadata = LoLAPretrainStreamingDataset._build_metadata_polars(repo_id="test", root=dataset_root, revision=None)
         preprocessor, postprocessor = make_lola_pre_post_processors(
             config=config,
             dataset_stats={},
