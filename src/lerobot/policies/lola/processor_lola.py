@@ -171,16 +171,21 @@ class LolaEmptyTokenProcessor(ObservationProcessorStep):
 class LolaImageProcessor(ObservationProcessorStep):
     """
     Processes multi-camera images for Qwen3.5 vision encoder.
-    
+
     This processor:
     1. Extracts images from observation.images.* keys
-    2. Converts tensors to PIL Images for Qwen3.5 processor
-    3. Stores images in a format ready for chat template processing
-    
-    Qwen3.5 supports multiple images in a single conversation turn.
-    The images are passed to the processor's apply_chat_template method.
+    2. Skips invalid cameras based on camera_valid_mask
+    3. Collects PIL Images for Qwen3.5 apply_chat_template
+
+    Supports two input formats:
+    - Pretrain mode: camera values are PIL Image (valid) or None (invalid),
+      passed as lists from the DataLoader collate (dynamic resolution).
+    - Standard mode: camera values are tensors [C, H, W] (legacy fallback).
+
+    Qwen3.5 supports multiple images in a single conversation turn with
+    dynamic resolution, so different camera resolutions are handled natively.
     """
-    
+
     def __init__(self, camera_keys: list[str] | None = None, **kwargs):
         """
         Args:
@@ -189,60 +194,81 @@ class LolaImageProcessor(ObservationProcessorStep):
         """
         super().__init__(**kwargs)
         self.camera_keys = camera_keys
-    
+
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
         Extracts and prepares images for Qwen3.5 vision encoder.
-        
+
         Args:
             observation: The observation dictionary containing image data.
-            
+
         Returns:
-            Updated observation with '_images' key containing PIL Images list.
+            Updated observation with '_lola_images' key containing PIL Images list.
         """
         new_observation = dict(observation)
-        
+
         # Determine camera keys
         camera_keys = self.camera_keys
         if camera_keys is None:
             # Auto-detect camera keys (keys starting with 'observation.images.')
             camera_keys = [k for k in observation.keys() if k.startswith('observation.images.')]
-        
+
         if not camera_keys:
             return observation
-        
+
+        # Get camera validity mask
+        # In pretrain mode, camera_valid_mask is routed to complementary_data by
+        # batch_to_transition (it lacks the "observation." prefix). Read it from
+        # self.transition, mirroring how LolaQwenProcessor reads "task".
+        camera_valid_mask = observation.get('camera_valid_mask', {})
+        if not camera_valid_mask:
+            # Fallback: check complementary_data via transition
+            if hasattr(self, 'transition') and self.transition is not None:
+                from lerobot.processor.core import TransitionKey
+                comp_data = self.transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+                camera_valid_mask = comp_data.get('camera_valid_mask', {})
+
         images = []
         for cam_key in camera_keys:
-            if cam_key in observation:
-                img_tensor = observation[cam_key]
-                
-                # Handle different tensor formats
-                if isinstance(img_tensor, torch.Tensor):
-                    # Assuming tensor is [C, H, W] or [H, W, C]
-                    if img_tensor.dim() == 3:
-                        # Check if channel-first or channel-last
-                        if img_tensor.shape[0] in [1, 3]:  # Channel-first [C, H, W]
-                            img_tensor = img_tensor.permute(1, 2, 0)  # Convert to [H, W, C]
-                        
-                        # Convert to uint8 for PIL
-                        if img_tensor.dtype in [torch.float32, torch.float64]:
-                            img_tensor = (img_tensor * 255).clamp(0, 255).to(torch.uint8)
-                        
-                        # Convert to numpy then PIL
-                        img_np = img_tensor.cpu().numpy()
-                        pil_img = Image.fromarray(img_np)
-                        images.append(pil_img)
-                elif isinstance(img_tensor, Image.Image):
-                    images.append(img_tensor)
-                elif isinstance(img_tensor, dict) and 'image' in img_tensor:
-                    # Already in Qwen3.5 format
-                    images.append(img_tensor['image'])
-        
+            if cam_key not in observation:
+                continue
+
+            # Skip invalid cameras
+            if not camera_valid_mask.get(cam_key, True):
+                continue
+
+            img_data = observation[cam_key]
+
+            # Handle list format (dynamic resolution from DataLoader collate)
+            if isinstance(img_data, list):
+                for img in img_data:
+                    if img is not None:
+                        if isinstance(img, Image.Image):
+                            images.append(img)
+                        elif isinstance(img, torch.Tensor) and img.dim() == 3:
+                            # Legacy fallback: convert tensor to PIL
+                            images.append(self._tensor_to_pil(img))
+            elif isinstance(img_data, Image.Image):
+                images.append(img_data)
+            elif isinstance(img_data, torch.Tensor) and img_data.dim() == 3:
+                # Legacy fallback: single tensor [C, H, W]
+                images.append(self._tensor_to_pil(img_data))
+            elif isinstance(img_data, dict) and 'image' in img_data:
+                images.append(img_data['image'])
+
         # Store processed images for later use in chat template
         if images:
             new_observation['_lola_images'] = images
-        
+
         return new_observation
+
+    @staticmethod
+    def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+        """Convert [C, H, W] float32 tensor to PIL Image."""
+        img = tensor.permute(1, 2, 0)  # [C, H, W] → [H, W, C]
+        if img.dtype in [torch.float32, torch.float64]:
+            img = (img * 255).clamp(0, 255).to(torch.uint8)
+        return Image.fromarray(img.cpu().numpy())
     
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -362,7 +388,15 @@ class LolaQwenProcessor(ObservationProcessorStep):
         # Clean up temporary image storage
         if '_lola_images' in new_observation:
             del new_observation['_lola_images']
-        
+
+        # Clean up camera_valid_mask and camera key observations (not needed downstream)
+        if 'camera_valid_mask' in new_observation:
+            del new_observation['camera_valid_mask']
+        # Remove camera key observations (PIL Image / None / tensor) — already processed into pixel_values
+        for key in list(new_observation.keys()):
+            if key.startswith('observation.images.'):
+                del new_observation[key]
+
         return new_observation
     
     def transform_features(

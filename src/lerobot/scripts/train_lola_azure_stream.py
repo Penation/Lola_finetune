@@ -40,9 +40,10 @@ os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, NormalizationMode
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.lola_streaming_dataset import LoLAStreamingDataset, AsyncDecodeDataLoader
+from lerobot.datasets.lola_pretrain_streaming_dataset import LoLAPretrainStreamingDataset
 from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig, LoLAPolicy
 from lerobot.policies.factory import make_pre_post_processors
@@ -148,6 +149,61 @@ def create_lola_streaming_dataset(
     return dataset
 
 
+def create_lola_pretrain_streaming_dataset(
+    repo_id: str,
+    config: LoLAConfig,
+    root: str | None = None,
+    episodes: list | None = None,
+    image_transforms=None,
+    max_history_length: int = 100,
+    history_padding_side: str = "left",
+    streaming: bool = True,
+    buffer_size: int = 1000,
+    seed: int = 42,
+    shuffle: bool = True,
+    deferred_video_decode: bool = True,
+    async_decode: bool = False,
+    decode_device: str = "cpu",
+    decode_num_threads: int = 1,
+    num_dataloader_workers: int = 0,
+    dataset_to_episodes_path: str | None = None,
+):
+    """创建 LoLA 预训练流式数据集（支持多子数据集 per-dataset 归一化）"""
+    dataset_metadata = LeRobotDatasetMetadata(repo_id, root=root)
+    fps = dataset_metadata.fps
+
+    delta_timestamps = {}
+    delta_timestamps["observation.state"] = [i / fps for i in config.observation_delta_indices]
+    delta_timestamps["action"] = [i / fps for i in config.action_delta_indices]
+    for key in dataset_metadata.camera_keys:
+        delta_timestamps[key] = [i / fps for i in config.observation_delta_indices]
+
+    logger.info(f"delta_timestamps: {delta_timestamps}")
+
+    dataset = LoLAPretrainStreamingDataset(
+        repo_id=repo_id,
+        max_history_length=max_history_length,
+        action_chunk_size=config.action_chunk_size,
+        history_padding_side=history_padding_side,
+        root=root,
+        episodes=episodes,
+        image_transforms=image_transforms,
+        delta_timestamps=delta_timestamps,
+        streaming=streaming,
+        buffer_size=buffer_size,
+        seed=seed,
+        shuffle=shuffle,
+        deferred_video_decode=deferred_video_decode,
+        async_decode=async_decode,
+        decode_device=decode_device,
+        decode_num_threads=decode_num_threads,
+        num_dataloader_workers=num_dataloader_workers,
+        dataset_to_episodes_path=dataset_to_episodes_path,
+    )
+
+    return dataset
+
+
 # 导入训练器（与 train_lola_azure.py 完全相同）
 from train_lola_azure import LoLATrainer
 
@@ -213,6 +269,12 @@ def main():
     # DataLoader 参数
     parser.add_argument("--num_workers", type=int, default=4)
 
+    # 预训练参数
+    parser.add_argument("--pretrain", action="store_true",
+                        help="启用预训练模式（使用 LoLAPretrainStreamingDataset，per-sub-dataset 归一化）")
+    parser.add_argument("--dataset_to_episodes_path", type=str, default=None,
+                        help="dataset_to_episodes.json 路径（预训练模式必须）")
+
     args = parser.parse_args()
 
     if args.dataset_repo_id is None and args.dataset_root is None:
@@ -229,6 +291,9 @@ def main():
         logger.info(f"Streaming: True")
         logger.info(f"Buffer Size: {args.buffer_size}")
         logger.info(f"VLM Path: {args.vlm_path}")
+        if args.pretrain:
+            logger.info(f"Pretrain Mode: True")
+            logger.info(f"Dataset to Episodes: {args.dataset_to_episodes_path}")
         logger.info("=" * 60)
 
     # 获取数据集元数据
@@ -262,24 +327,54 @@ def main():
         history_padding_side=args.history_padding_side,
     )
 
+    # 预训练模式：归一化由 dataset 内部完成，processor 使用 IDENTITY
+    if args.pretrain:
+        config.normalization_mapping = {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        }
+
     # 创建流式数据集
-    logger.info("Creating streaming dataset...")
-    train_dataset = create_lola_streaming_dataset(
-        repo_id=args.dataset_repo_id,
-        config=config,
-        root=args.dataset_root,
-        episodes=args.episodes,
-        max_history_length=args.max_history_length,
-        history_padding_side=args.history_padding_side,
-        buffer_size=args.buffer_size,
-        seed=args.streaming_seed,
-        shuffle=not args.no_shuffle,
-        deferred_video_decode=not args.no_deferred,
-        async_decode=args.async_decode,
-        decode_device=args.decode_device,
-        decode_num_threads=args.decode_num_threads,
-        num_dataloader_workers=args.num_workers,
-    )
+    if args.pretrain:
+        if args.dataset_to_episodes_path is None:
+            raise ValueError("--dataset_to_episodes_path is required for --pretrain mode")
+        logger.info("Creating pretrain streaming dataset...")
+        train_dataset = create_lola_pretrain_streaming_dataset(
+            repo_id=args.dataset_repo_id,
+            config=config,
+            root=args.dataset_root,
+            episodes=args.episodes,
+            max_history_length=args.max_history_length,
+            history_padding_side=args.history_padding_side,
+            buffer_size=args.buffer_size,
+            seed=args.streaming_seed,
+            shuffle=not args.no_shuffle,
+            deferred_video_decode=not args.no_deferred,
+            async_decode=args.async_decode,
+            decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
+            num_dataloader_workers=args.num_workers,
+            dataset_to_episodes_path=args.dataset_to_episodes_path,
+        )
+    else:
+        logger.info("Creating streaming dataset...")
+        train_dataset = create_lola_streaming_dataset(
+            repo_id=args.dataset_repo_id,
+            config=config,
+            root=args.dataset_root,
+            episodes=args.episodes,
+            max_history_length=args.max_history_length,
+            history_padding_side=args.history_padding_side,
+            buffer_size=args.buffer_size,
+            seed=args.streaming_seed,
+            shuffle=not args.no_shuffle,
+            deferred_video_decode=not args.no_deferred,
+            async_decode=args.async_decode,
+            decode_device=args.decode_device,
+            decode_num_threads=args.decode_num_threads,
+            num_dataloader_workers=args.num_workers,
+        )
 
     # IterableDataset 不使用 DistributedSampler，由数据集内部处理分片
     # 使用 AsyncDecodeDataLoader 处理视频解码 + 变长序列 collate
@@ -297,9 +392,12 @@ def main():
     )
 
     # 创建训练器
+    # 预训练模式：dataset_stats 传空 dict（归一化由 dataset 内部完成，processor 全 IDENTITY）
+    # 正常模式：传全局 dataset stats 给 processor 的 NormalizerProcessorStep
+    dataset_stats = {} if args.pretrain else dataset_metadata.stats
     trainer = LoLATrainer(
         config=config,
-        dataset_stats=dataset_metadata.stats,
+        dataset_stats=dataset_stats,
         dist_info=dist_info,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
