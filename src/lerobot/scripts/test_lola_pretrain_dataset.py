@@ -450,7 +450,7 @@ def main():
                         help="每个测试最多迭代的 item 数")
     parser.add_argument("--skip_collate", action="store_true",
                         help="跳过 collate 测试（耗时较长）")
-    parser.add_argument("--sub_root", type=str, required=True,
+    parser.add_argument("--sub_root", type=str,
                         help="子数据集根目录（合并数据集）")
 
     args = parser.parse_args()

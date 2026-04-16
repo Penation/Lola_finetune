@@ -65,6 +65,7 @@ import torch
 
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDatasetMetadata
 from lerobot.datasets.utils import (
+    EPISODES_DIR,
     Backtrackable,
     LookAheadError,
     LookBackError,
@@ -73,6 +74,9 @@ from lerobot.datasets.utils import (
     get_delta_indices,
     is_float_in_list,
     item_to_torch,
+    load_info,
+    load_stats,
+    load_tasks,
 )
 from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -602,6 +606,106 @@ def _discover_parquet_files(root: str) -> list[str]:
     return [str(f) for f in files]
 
 
+def _load_episodes_polars(root) -> list[dict]:
+    """使用 polars 加载 episodes 元数据，避免 HF datasets 的 CastError。
+
+    当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含
+    不同的列（因为不同子数据集有不同的 camera keys，产生不同的
+    stats/ 和 videos/ 列）。HF datasets 的 Dataset.from_parquet()
+    会尝试统一 schema 并进行 cast，导致 "column names don't match" 错误。
+
+    polars 的 vertical_relaxed 策略可以安全合并列不完全一致的 parquet 文件，
+    缺失的列自动填充 null，不会报错。
+    只保留非 stats/ 列（与原 load_episodes 的 select_columns 行为一致）。
+
+    Returns:
+        list[dict]: 按 episode_index 排序的 episode 元数据列表，
+        每个 dict 包含 data/chunk_index, videos/.../from_timestamp 等字段。
+    """
+    from pathlib import Path
+
+    episodes_dir = Path(root) / EPISODES_DIR
+    if not episodes_dir.exists():
+        raise FileNotFoundError(f"Episodes directory not found: {episodes_dir}")
+
+    parquet_files = sorted(episodes_dir.glob("*/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files in {episodes_dir}")
+
+    dfs = []
+    for path in parquet_files:
+        df = pl.scan_parquet(str(path)).collect()
+        if df.height > 0:
+            dfs.append(df)
+
+    if not dfs:
+        return []
+
+    combined = pl.concat(dfs, how="diagonal")
+
+    # Drop stats/ columns (same as original load_episodes behavior)
+    non_stats_cols = [c for c in combined.columns if not c.startswith("stats/")]
+    combined = combined.select(non_stats_cols)
+
+    # Sort by episode_index and convert to list of dicts
+    combined = combined.sort("episode_index")
+
+    # Fill null values for known column patterns before converting to dicts.
+    # When sub-datasets have different camera keys, polars diagonal concat
+    # fills missing columns with null. We need appropriate defaults:
+    # - is_valid columns: default 0 (invalid), so episodes without a camera
+    #   are treated as invalid (skip decoding) rather than crashing
+    # - Other video columns (chunk_index, file_index, timestamps): default 0
+    # - Data/meta columns: default 0
+    for col in combined.columns:
+        if col.endswith("/is_valid"):
+            combined = combined.with_columns(
+                pl.col(col).fill_null(0)
+            )
+        elif combined[col].dtype in (pl.Int64, pl.Float64, pl.Int32, pl.Float32):
+            combined = combined.with_columns(
+                pl.col(col).fill_null(0)
+            )
+
+    episodes = []
+    for i in range(combined.height):
+        row = combined.row(i, named=True)
+        # Convert numpy types to Python native types for consistency
+        ep_dict = {}
+        for key, val in row.items():
+            if val is None:
+                # Skip None values entirely - .get(key, default) will use the default
+                continue
+            if isinstance(val, (np.integer,)):
+                val = int(val)
+            elif isinstance(val, (np.floating,)):
+                val = float(val)
+            elif isinstance(val, (np.ndarray,)):
+                val = val.tolist()
+            ep_dict[key] = val
+        episodes.append(ep_dict)
+
+    return episodes
+
+
+class _EpisodeAccessor:
+    """提供与 HF Dataset 兼容的 episodes[idx] 字典式访问接口。
+
+    包装 _load_episodes_polars 返回的 list[dict]，使得
+    self.meta.episodes[ep_idx] 返回的 dict 支持 .get() 方法
+    （HF Dataset row 返回的是 dict，原生支持 .get()）。
+    """
+
+    def __init__(self, episodes: list[dict]):
+        self._episodes = episodes
+
+    def __getitem__(self, idx: int) -> dict:
+        return self._episodes[idx]
+
+    def __len__(self) -> int:
+        return len(self._episodes)
+
+
 class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
     """
     支持流式加载完整历史 action 的 LoLA 预训练数据集。
@@ -716,8 +820,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self._num_dataloader_workers = num_dataloader_workers
         self._decode_pipeline = None
 
-        # 加载元数据（不加载 HF dataset）
-        self.meta = LeRobotDatasetMetadata(
+        # 加载元数据（使用 polars 加载 episodes，避免 HF datasets CastError）
+        # 当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含不同的列
+        # （因为不同子数据集有不同的 camera keys），导致 HF datasets 的
+        # Dataset.from_parquet() 在统一 schema 时报 CastError。
+        # 使用 polars 的 vertical_relaxed 策略安全合并，缺失列自动填充 null。
+        self.meta = self._load_metadata_polars(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
@@ -762,6 +870,74 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         print(f"[LoLAPretrainStreamingDataset] parquet_files: {len(self._parquet_files)}")
         print(f"[LoLAPretrainStreamingDataset] total_rows: {self._total_rows}")
         print(f"[LoLAPretrainStreamingDataset] sub_datasets: {len(self._sub_dataset_names)}")
+
+    @staticmethod
+    def _load_metadata_polars(repo_id, root, revision, force_cache_sync=False):
+        """加载元数据，使用 polars 加载 episodes 以避免 HF datasets CastError。
+
+        当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含
+        不同的列（因为不同子数据集有不同的 camera keys），导致 HF datasets
+        的 Dataset.from_parquet() 在统一 schema 时报 CastError:
+        "column names don't match"。
+
+        此方法先尝试使用标准 LeRobotDatasetMetadata 加载，如果 episodes
+        加载失败，则手动加载 info/tasks/stats 并用 polars 加载 episodes。
+
+        Returns:
+            LeRobotDatasetMetadata 实例（episodes 替换为 _EpisodeAccessor）
+        """
+        try:
+            meta = LeRobotDatasetMetadata(
+                repo_id, root, revision, force_cache_sync=force_cache_sync
+            )
+            return meta
+        except Exception as e:
+            err_msg = str(e)
+            if "column names don't match" not in err_msg and "CastError" not in err_msg:
+                raise  # Not the expected error, re-raise
+
+            logger.warning(
+                f"[LoLAPretrainStreamingDataset] HF datasets CastError when loading episodes: {e}. "
+                f"Falling back to polars-based episodes loading."
+            )
+
+            # 手动加载元数据组件
+            from pathlib import Path
+            meta_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+            _revision = revision if revision else CODEBASE_VERSION
+
+            if force_cache_sync:
+                from lerobot.datasets.lerobot_dataset import is_valid_version, get_safe_version
+                if is_valid_version(_revision):
+                    _revision = get_safe_version(repo_id, _revision)
+                (meta_root / "meta").mkdir(exist_ok=True, parents=True)
+                from huggingface_hub import snapshot_download
+                snapshot_download(
+                    repo_id, repo_type="dataset", revision=_revision,
+                    local_dir=meta_root, allow_patterns="meta/",
+                )
+
+            # 手动构建 metadata 对象，避免再次触发 load_episodes
+            meta = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+            meta.repo_id = repo_id
+            meta.revision = _revision
+            meta.root = meta_root
+            meta.writer = None
+            meta.latest_episode = None
+            meta.metadata_buffer = []
+            meta.metadata_buffer_size = 10
+
+            meta.info = load_info(meta_root)
+            meta.tasks = load_tasks(meta_root)
+            meta.stats = load_stats(meta_root)
+
+            # 使用 polars 加载 episodes
+            episodes_list = _load_episodes_polars(meta_root)
+            meta.episodes = _EpisodeAccessor(episodes_list)
+
+            print(f"[LoLAPretrainStreamingDataset] Loaded {len(episodes_list)} episodes via polars "
+                  f"(HF datasets CastError fallback)")
+            return meta
 
     def _load_dataset_to_episodes(self, dataset_to_episodes_path: str):
         """Load dataset_to_episodes.json and build per-sub-dataset normalization data.
