@@ -3,12 +3,15 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import logging
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 from typing import Optional, Tuple, List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 from diffusers.models.transformers.transformer_flux2 import (
     Flux2TransformerBlock,
@@ -255,7 +258,8 @@ class LoLADiT(nn.Module):
         return context_rope, target_rope, all_rope
 
     def forward(self, target_actions, hist_actions, vlm_features, empty_emb, timestep,
-                hist_actions_mask=None, return_chunks: bool = False):
+                hist_actions_mask=None, return_chunks: bool = False,
+                use_gradient_checkpointing: bool = False):
         """
         Args:
             target_actions: [B, num_chunks, dit_hidden_size] - 加噪后的目标动作chunks
@@ -327,24 +331,50 @@ class LoLADiT(nn.Module):
         )
         
         for block in self.double_blocks:
-            context_features, target_actions = block(
-                hidden_states=target_actions,
-                encoder_hidden_states=context_features,
-                temb_mod_img=temb_mod_img,
-                temb_mod_txt=temb_mod_txt,
-                image_rotary_emb=all_rope,  # 使用 all_rope 因为 attention 中会拼接 encoder 和 target
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+            if use_gradient_checkpointing:
+                context_features, target_actions = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states=target_actions,
+                    encoder_hidden_states=context_features,
+                    temb_mod_img=temb_mod_img,
+                    temb_mod_txt=temb_mod_txt,
+                    image_rotary_emb=all_rope,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                context_features, target_actions = block(
+                    hidden_states=target_actions,
+                    encoder_hidden_states=context_features,
+                    temb_mod_img=temb_mod_img,
+                    temb_mod_txt=temb_mod_txt,
+                    image_rotary_emb=all_rope,  # 使用 all_rope 因为 attention 中会拼接 encoder 和 target
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
 
         for block in self.single_blocks:
-            context_features, target_actions = block(
-                hidden_states=target_actions,
-                encoder_hidden_states=context_features,
-                temb_mod=temb_mod_single,
-                image_rotary_emb=all_rope,
-                joint_attention_kwargs=joint_attention_kwargs,
-                split_hidden_states=True
-            )
+            if use_gradient_checkpointing:
+                context_features, target_actions = torch.utils.checkpoint.checkpoint(
+                    block,
+                    hidden_states=target_actions,
+                    encoder_hidden_states=context_features,
+                    temb_mod=temb_mod_single,
+                    image_rotary_emb=all_rope,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    split_hidden_states=True,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                context_features, target_actions = block(
+                    hidden_states=target_actions,
+                    encoder_hidden_states=context_features,
+                    temb_mod=temb_mod_single,
+                    image_rotary_emb=all_rope,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                    split_hidden_states=True
+                )
             
         # 根据 return_chunks 决定返回 chunk 特征还是解码后的动作
         if return_chunks:
@@ -368,6 +398,25 @@ class LoLAPytorch(nn.Module):
         self.vlm_bridge = LolaVLMFeatureExtractor(config)
         self.action_encoder = LolaActionEncoder(config)
         self.dit = LoLADiT(config)
+        self.gradient_checkpointing_enabled = False
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory optimization."""
+        self.gradient_checkpointing_enabled = True
+        logger.info("Enabled gradient checkpointing for LoLAPytorch model")
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self.gradient_checkpointing_enabled = False
+        logger.info("Disabled gradient checkpointing for LoLAPytorch model")
+
+    def _apply_checkpoint(self, func, *args, **kwargs):
+        """Helper method to apply gradient checkpointing if enabled."""
+        if self.gradient_checkpointing_enabled and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
+            )
+        return func(*args, **kwargs)
 
     def forward(self, hidden_states_all_layers, input_ids, hist_actions, target_actions,
                 hist_actions_mask=None, time=None, noise=None):
@@ -437,7 +486,8 @@ class LoLAPytorch(nn.Module):
         pred_x0_chunks = self.dit(
             x_t, hist_chunks, vlm_features, empty_emb, time,
             hist_actions_mask=hist_chunks_mask,
-            return_chunks=True
+            return_chunks=True,
+            use_gradient_checkpointing=self.gradient_checkpointing_enabled and self.training,
         )
         
         # 4. 从预测的 x_0 推导预测的流速 v
@@ -540,7 +590,8 @@ class LoLAPytorch(nn.Module):
                 empty_emb=empty_emb,
                 timestep=expanded_time,
                 hist_actions_mask=hist_chunks_mask,
-                return_chunks=True
+                return_chunks=True,
+                use_gradient_checkpointing=False,  # No checkpointing during inference
             )
 
             # 计算流速: v = noise - x_0，但噪声未知
@@ -615,7 +666,13 @@ class LoLAPolicy(PreTrainedPolicy):
             )
         
         self.model.to(self._dtype)
-        
+
+        # Enable gradient checkpointing if configured
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            if config.train_vlm:
+                self.vlm.gradient_checkpointing_enable()
+
         # 初始化动作队列
         self._action_queue = deque(maxlen=self.config.action_chunk_size * 5)
     

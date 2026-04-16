@@ -7,10 +7,10 @@ eval "$(conda shell.bash hook)"
 conda activate lerobot-gcr3
 
 # 基础训练参数
-STRATEGY="deepspeed"
+STRATEGY="fsdp"
 DEVICES=2
 NUM_NODES=1
-BATCH_SIZE=4
+BATCH_SIZE=2
 MAX_STEPS=10000
 LEARNING_RATE=2.5e-5
 PRECISION="bf16-mixed"
@@ -41,12 +41,16 @@ cmd="torchrun --nproc_per_node=${DEVICES} src/lerobot/scripts/train_lola_multigp
     --precision ${PRECISION} \
     --log_every_n_steps ${LOG_EVERY_N_STEPS} \
     --save_every_n_steps ${SAVE_INTERVAL} \
-    --vlm_path ${VLM_PATH}"
+    --vlm_path ${VLM_PATH} \
+    --train_vlm "
 
 # 如果启用完整历史action加载
 if [ "$LOAD_FULL_HISTORY" = true ]; then
-    cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
+    cmd="${cmd} --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
 fi
+# if [ "$LOAD_FULL_HISTORY" = true ]; then
+#     cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
+# fi
 
 echo "Running: $cmd"
 eval $cmd
