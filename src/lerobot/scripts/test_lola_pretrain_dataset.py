@@ -43,7 +43,7 @@ from lerobot.datasets.utils import dataset_to_policy_features
 from lerobot.policies.lola import LoLAConfig
 
 
-def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=None):
+def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=None, temp_process=False):
     """测试 1: 基本数据集加载"""
     print("\n" + "=" * 60)
     print("Test 1: Basic Dataset Loading")
@@ -88,6 +88,7 @@ def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=Non
         shuffle=False,
         deferred_video_decode=False,  # 直接解码模式，方便检查帧内容
         dataset_to_episodes_path=dataset_to_episodes_path,
+        temp_process=temp_process,
     )
 
     print(f"  Dataset created: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
@@ -375,7 +376,7 @@ def test_collate(dataset, batch_size=3):
     print("  PASSED")
 
 
-def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None, sub_root=None):
+def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None, sub_root=None, temp_process=False):
     """测试 6: Lightweight (deferred decode) 模式"""
     print("\n" + "=" * 60)
     print("Test 6: Lightweight / Deferred Decode Mode")
@@ -420,6 +421,7 @@ def test_lightweight_mode(dataset_root, dataset_to_episodes_path=None, sub_root=
         shuffle=False,
         deferred_video_decode=True,  # 启用延迟解码
         dataset_to_episodes_path=dataset_to_episodes_path,
+        temp_process=temp_process,
     )
 
     # 用 decode_on_yield 模式迭代（deferred + not async）
@@ -469,6 +471,9 @@ def main():
                         help="跳过 collate 测试（耗时较长）")
     parser.add_argument("--sub_root", type=str,
                         help="子数据集根目录（合并数据集）")
+    parser.add_argument("--temp_process", action="store_true",
+                        help="临时处理模式：当子数据集 stats 维度与全局 action_dim 不一致时，"
+                             "对 stats 进行 zero-padding 而非报错（仅适用于单臂数据集）")
 
     args = parser.parse_args()
 
@@ -485,7 +490,7 @@ def main():
 
     # Test 1: Basic loading
     time_start = time.time()
-    dataset = test_basic_loading(args.dataset_root, dataset_to_episodes_path, sub_root)
+    dataset = test_basic_loading(args.dataset_root, dataset_to_episodes_path, sub_root, args.temp_process)
     time_stage_1 = time.time()
     print(f"Dataset loading time: {time_stage_1 - time_start:.3f} seconds")
 
@@ -511,7 +516,7 @@ def main():
         print(f"Dataset collate time: {time_stage_5 - time_stage_4:.3f} seconds")
 
     # Test 6: Lightweight mode
-    test_lightweight_mode(args.dataset_root, dataset_to_episodes_path, sub_root)
+    test_lightweight_mode(args.dataset_root, dataset_to_episodes_path, sub_root, args.temp_process)
     time_stage_6 = time.time()
     if not args.skip_collate:
         print(f"Dataset lightweight mode time: {time_stage_6 - time_stage_5:.3f} seconds")

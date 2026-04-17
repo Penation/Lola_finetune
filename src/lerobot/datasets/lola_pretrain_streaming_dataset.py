@@ -797,6 +797,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         async_decode: bool = False,
         num_dataloader_workers: int = 0,
         dataset_to_episodes_path: str | None = None,
+        temp_process: bool = False,
     ):
         """
         Args:
@@ -839,6 +840,9 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 管线的 VideoDecoder 缓存容量。仅在 async_decode=True 时需要。
             dataset_to_episodes_path: JSON 文件路径，包含 episode 到子数据集的映射。
                 当提供时，启用 per-sub-dataset 归一化。
+            temp_process: 临时处理模式。当子数据集 stats 维度与全局 action_dim 不一致时，
+                若为 True，对 stats 进行 zero-padding 以匹配全局维度（仅适用于单臂数据集）；
+                若为 False（默认），直接 raise ValueError。待所有子数据集 stats 更新后可移除此参数。
         """
         super().__init__()  # torch.utils.data.IterableDataset.__init__
 
@@ -868,6 +872,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         self.async_decode = async_decode
         self._num_dataloader_workers = num_dataloader_workers
         self._decode_pipeline = None
+        self.temp_process = temp_process
 
         # 加载元数据（使用 polars 加载 episodes，避免 HF datasets CastError）
         # 当合并多个子数据集时，meta/episodes/ 下的 parquet 文件可能包含不同的列
@@ -1061,11 +1066,19 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             mask[offset:offset + 3] = True  # 平移 (x, y, z)
         return mask
 
-    def _normalize_per_subdataset(self, item):
+    def _normalize_per_subdataset(self, item, temp_process=False):
         """Per-sub-dataset normalization for observation.state, action, and hist_actions_full.
 
         仅对平移维度 (每臂 dim 0-2) 进行 mean/std 归一化,
         orth6D 旋转和夹爪状态天然在 [-1, 1] 范围内, 不需归一化。
+
+        当子数据集的 stats 维度与全局 action_dim 不一致时：
+        - temp_process=True: 对 stats 的 mean/std 进行 zero-padding 以匹配全局维度,
+          仅归一化子数据集原生维度（padding 部分的 mean=0, std=1, 归一化后值不变）
+        - temp_process=False (默认): 直接 raise ValueError
+
+        注意: temp_process=True 仅适用于单臂数据集 (stats_dim < action_dim)，
+        双臂数据集的 stats 维度不匹配时应更新子数据集的 stats.json 而非使用 padding。
         """
         ep_idx = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
         if ep_idx >= len(self._episode_to_ds_idx) or self._episode_to_ds_idx[ep_idx] < 0:
@@ -1077,22 +1090,48 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         if stats is None:
             return item  # No stats available for this sub-dataset
 
+        # Check dimension compatibility and pad stats if needed
+        padded_stats = {}
+        for key in ("observation.state", "action"):
+            if key not in stats:
+                continue
+            mean, std = stats[key]["mean"], stats[key]["std"]
+
+            if key == "action" and mean.shape[0] != self.action_dim:
+                if not temp_process:
+                    raise ValueError(
+                        f"Sub-dataset {self._sub_dataset_names[ds_idx]} has action dim "
+                        f"{mean.shape[0]} but global action_dim is {self.action_dim}. "
+                        f"Set temp_process=True to pad stats, or update the sub-dataset's stats.json."
+                    )
+                # Zero-pad mean and std: padded dims get mean=0, std=1 (no-op normalization)
+                pad_len = self.action_dim - mean.shape[0]
+                mean = torch.cat([mean, torch.zeros(pad_len)])
+                std = torch.cat([std, torch.ones(pad_len)])
+                logger.warning(
+                    f"[LoLAPretrainStreamingDataset] Padded stats for '{key}' in "
+                    f"sub-dataset '{self._sub_dataset_names[ds_idx]}' from "
+                    f"{stats[key]['mean'].shape[0]} to {self.action_dim} dims (temp_process mode)"
+                )
+
+            padded_stats[key] = {"mean": mean, "std": std}
+
         # observation.state: (x - mean) / (std + eps)
-        if "observation.state" in item and "observation.state" in stats:
-            mean, std = stats["observation.state"]["mean"], stats["observation.state"]["std"]
+        if "observation.state" in item and "observation.state" in padded_stats:
+            mean, std = padded_stats["observation.state"]["mean"], padded_stats["observation.state"]["std"]
             item["observation.state"] = (item["observation.state"] - mean) / (std + 1e-8)
 
         # action: 仅归一化平移维度
-        if "action" in item and "action" in stats:
-            mean, std = stats["action"]["mean"], stats["action"]["std"]
+        if "action" in item and "action" in padded_stats:
+            mean, std = padded_stats["action"]["mean"], padded_stats["action"]["std"]
             norm_mask = self._make_translation_norm_mask(mean.shape[0])
             action = item["action"]
             normalized = (action - mean) / (std + 1e-8)
             item["action"] = torch.where(norm_mask, normalized, action)
 
         # hist_actions_full: 仅归一化平移维度 (mask=True 部分)
-        if "hist_actions_full" in item and "action" in stats:
-            mean, std = stats["action"]["mean"], stats["action"]["std"]
+        if "hist_actions_full" in item and "action" in padded_stats:
+            mean, std = padded_stats["action"]["mean"], padded_stats["action"]["std"]
             norm_mask = self._make_translation_norm_mask(mean.shape[0])
             mask = item["hist_actions_mask"]  # [SeqLen]
             normalized = (item["hist_actions_full"] - mean) / (std + 1e-8)
@@ -1383,7 +1422,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         result = self._add_history_actions(result, dataset_iterator)
 
         # Per-sub-dataset normalization (after history actions and camera valid mask)
-        result = self._normalize_per_subdataset(result)
+        result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
 
         # Add dimension info
         ds_idx = self._episode_to_ds_idx[ep_idx] if ep_idx < len(self._episode_to_ds_idx) and self._episode_to_ds_idx[ep_idx] >= 0 else 0
@@ -1455,7 +1494,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         result = self._add_history_actions(result, dataset_iterator)
 
         # Per-sub-dataset normalization (after history actions)
-        result = self._normalize_per_subdataset(result)
+        result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
 
         # Add dimension info
         ds_idx = self._episode_to_ds_idx[ep_idx] if ep_idx < len(self._episode_to_ds_idx) and self._episode_to_ds_idx[ep_idx] >= 0 else 0
@@ -1509,7 +1548,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         lightweight_frame = self._apply_camera_valid_mask(lightweight_frame, ep_idx)
 
         # Per-sub-dataset normalization (after camera valid mask)
-        lightweight_frame = self._normalize_per_subdataset(lightweight_frame)
+        lightweight_frame = self._normalize_per_subdataset(lightweight_frame, temp_process=self.temp_process)
 
         return lightweight_frame
 
@@ -1635,7 +1674,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             result = self._apply_camera_valid_mask(result, ep_idx)
 
             # Per-sub-dataset normalization
-            result = self._normalize_per_subdataset(result)
+            result = self._normalize_per_subdataset(result, temp_process=self.temp_process)
 
             return result
 
