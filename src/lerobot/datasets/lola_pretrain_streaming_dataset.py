@@ -1007,8 +1007,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             self._sub_dataset_names.append(ds_name)
             self._sub_dataset_paths.append(ds_path)
 
-            # Load per-sub-dataset stats
-            stats_path = os.path.join(str(self.sub_root), ds_path, "meta", "stats.json")
+            # Load per-sub-dataset stats (skip if sub_root not provided)
+            if self.sub_root is not None:
+                stats_path = os.path.join(str(self.sub_root), ds_path, "meta", "stats.json")
+            else:
+                stats_path = None
             norm_params = None
             action_dim = self.action_dim
             state_dim = 0
