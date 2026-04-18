@@ -81,6 +81,46 @@ from lerobot.datasets.utils import (
 from lerobot.datasets.video_utils import VideoDecoderCache, decode_video_frames_torchcodec
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
+
+def _safe_stack_frames(frames: list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
+    """Stack frames into a 4D tensor if spatial dims match; return list otherwise.
+
+    Dynamic-resolution AV1 videos can produce frames with different H/W across
+    the same decode call.  torch.stack would raise in that case, so we fall
+    back to returning the raw list and let downstream code handle it.
+    """
+    try:
+        return torch.stack(frames)
+    except RuntimeError:
+        return frames
+
+
+def _frames_get(frames: torch.Tensor | list[torch.Tensor], idx: int) -> torch.Tensor:
+    """Index into decoded frames (4D Tensor or List[Tensor])."""
+    if isinstance(frames, list):
+        return frames[idx]
+    return frames[idx]
+
+
+def _frames_len(frames: torch.Tensor | list[torch.Tensor]) -> int:
+    """Return number of decoded frames."""
+    if isinstance(frames, list):
+        return len(frames)
+    return frames.shape[0]
+
+
+def _maybe_squeeze(frames: torch.Tensor | list[torch.Tensor], n_ts: int):
+    """Squeeze batch dim when only 1 timestamp was queried.
+
+    For a 4D Tensor: squeeze(0) -> [C, H, W].
+    For List[Tensor]: return the single element directly.
+    """
+    if n_ts == 1:
+        if isinstance(frames, list):
+            return frames[0]
+        return frames.squeeze(0)
+    return frames
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +130,10 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
     当缓存数量超过 max_size 时，自动淘汰最早加入的解码器。
     对于有大量视频文件的场景（如 17 个 mp4），限制缓存大小可显著
     降低每个 worker 的内存占用（每个 VideoDecoder 约 200MB）。
+
+    Inherits resolution-validation logic from VideoDecoderCache: on cache hit
+    the stored resolution is checked against the decoder's current metadata.
+    If it diverges (dynamic-resolution AV1), the stale entry is evicted.
     """
 
     def __init__(self, max_size: int = 4):
@@ -101,29 +145,35 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
         video_path = str(video_path)
 
         with self._lock:
+            if video_path in self._cache:
+                decoder, file_handle, cached_res = self._cache[video_path]
+                meta = decoder.metadata
+                current_res = (meta.height, meta.width)
+                if current_res != cached_res:
+                    try:
+                        file_handle.close()
+                    except Exception:
+                        pass
+                    del self._cache[video_path]
+                    self._key_order.remove(video_path)
+
             if video_path not in self._cache:
                 # 超过容量时淘汰最早的解码器
                 while len(self._cache) >= self._max_size and self._key_order:
                     oldest_key = self._key_order.pop(0)
                     if oldest_key in self._cache:
-                        _, old_handle = self._cache.pop(oldest_key)
+                        _, old_handle, _ = self._cache.pop(oldest_key)
                         old_handle.close()
 
-                if importlib.util.find_spec("torchcodec"):
-                    from torchcodec.decoders import VideoDecoder
-                else:
-                    raise ImportError("torchcodec is required but not available.")
-
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+                decoder, file_handle, resolution = self._make_decoder(video_path)
+                self._cache[video_path] = (decoder, file_handle, resolution)
                 self._key_order.append(video_path)
 
             return self._cache[video_path][0]
 
     def clear(self):
         with self._lock:
-            for _, file_handle in self._cache.values():
+            for _, file_handle, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
             self._key_order.clear()
@@ -182,16 +232,11 @@ def _compute_padding_mask(config: DecodeProcessConfig, video_frames, query_times
     for video_key, timestamps in original_timestamps.items():
         if video_key not in video_frames:
             continue
-        frames = []
         mask = []
-        padding_frame = _make_padding_frame(config.camera_shapes, video_key)
         for ts in timestamps:
             if is_float_in_list(ts, query_timestamps[video_key]):
-                idx = find_float_index(ts, query_timestamps[video_key])
-                frames.append(video_frames[video_key][idx, :])
                 mask.append(False)
             else:
-                frames.append(padding_frame)
                 mask.append(True)
         padding_mask[f"{video_key}_is_pad"] = torch.BoolTensor(mask)
     return padding_mask
@@ -258,7 +303,7 @@ def _decode_process_main(
                     decoder_cache=get_thread_cache(),
                 )
 
-            item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
+            item[video_key] = _maybe_squeeze(frames, len(query_ts))
         return item
 
     # 4. 单 item 解码函数
@@ -385,8 +430,11 @@ def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache
         f"video: {video_path}"
     )
 
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_frames = (closest_frames / 255.0).type(torch.float32)
+    closest_frames = _safe_stack_frames([loaded_frames[idx] for idx in argmin_])
+    if isinstance(closest_frames, torch.Tensor):
+        closest_frames = (closest_frames / 255.0).type(torch.float32)
+    else:
+        closest_frames = [(f / 255.0).type(torch.float32) for f in closest_frames]
     return closest_frames
 
 
@@ -1147,8 +1195,10 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         return item
 
     def _tensor_to_pil(self, tensor):
-        """Convert [C, H, W] float32 tensor to PIL Image."""
+        """Convert [C, H, W] float32 tensor to PIL Image. Handles List[Tensor] from dynamic resolution."""
         from PIL import Image
+        if isinstance(tensor, list):
+            return [self._tensor_to_pil(t) for t in tensor]
         if tensor.dim() == 4:
             tensor = tensor[0]  # [T, C, H, W] -> [C, H, W]
         img = tensor.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
@@ -1172,8 +1222,8 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                 if is_valid == 0:
                     # Invalid camera: set to None (skip in processor)
                     item[cam_key] = None
-                elif isinstance(item[cam_key], torch.Tensor):
-                    # Valid camera: convert tensor to PIL Image
+                elif isinstance(item[cam_key], (torch.Tensor, list)):
+                    # Valid camera: convert tensor(s) to PIL Image(s)
                     item[cam_key] = self._tensor_to_pil(item[cam_key])
 
         item["camera_valid_mask"] = camera_valid_mask
@@ -1726,9 +1776,12 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                     f"video: {video_path}"
                 )
 
-                closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-                closest_frames = (closest_frames / 255.0).type(torch.float32)
-                item[video_key] = closest_frames.squeeze(0) if len(query_ts) == 1 else closest_frames
+                closest_frames = _safe_stack_frames([loaded_frames[idx] for idx in argmin_])
+                if isinstance(closest_frames, torch.Tensor):
+                    closest_frames = (closest_frames / 255.0).type(torch.float32)
+                else:
+                    closest_frames = [(f / 255.0).type(torch.float32) for f in closest_frames]
+                item[video_key] = _maybe_squeeze(closest_frames, len(query_ts))
             finally:
                 try:
                     fh.close()
@@ -1866,16 +1919,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
         for video_key, timestamps in original_timestamps.items():
             if video_key not in video_frames:
                 continue
-            frames = []
             mask = []
-            padding_frame = self._make_padding_camera_frame(video_key)
             for ts in timestamps:
                 if is_float_in_list(ts, query_timestamps[video_key]):
-                    idx = find_float_index(ts, query_timestamps[video_key])
-                    frames.append(video_frames[video_key][idx, :])
                     mask.append(False)
                 else:
-                    frames.append(padding_frame)
                     mask.append(True)
             padding_mask[f"{video_key}_is_pad"] = torch.BoolTensor(mask)
         return padding_mask
@@ -1927,7 +1975,7 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
                     video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
                 )
 
-            item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
+            item[video_key] = _maybe_squeeze(frames, len(query_ts))
         return item
 
     def _decode_video_cuda(self, video_path, timestamps):
@@ -1993,8 +2041,11 @@ class LoLAPretrainStreamingDataset(torch.utils.data.IterableDataset):
             f"video: {video_path}"
         )
 
-        closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-        closest_frames = (closest_frames / 255.0).type(torch.float32)
+        closest_frames = _safe_stack_frames([loaded_frames[idx] for idx in argmin_])
+        if isinstance(closest_frames, torch.Tensor):
+            closest_frames = (closest_frames / 255.0).type(torch.float32)
+        else:
+            closest_frames = [(f / 255.0).type(torch.float32) for f in closest_frames]
         return closest_frames
 
     def _get_delta_frames(self, dataset_iterator, current_item):

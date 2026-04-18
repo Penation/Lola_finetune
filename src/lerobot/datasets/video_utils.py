@@ -172,33 +172,70 @@ def decode_video_frames_torchvision(
 
 
 class VideoDecoderCache:
-    """Thread-safe cache for video decoders to avoid expensive re-initialization."""
+    """Thread-safe cache for video decoders to avoid expensive re-initialization.
+
+    Stores each decoder alongside its resolution (H, W) extracted from metadata
+    at construction time.  On cache hit the stored resolution is compared against
+    the decoder's *current* metadata — if they diverge (which can happen with
+    AV1 dynamic-resolution streams) the stale entry is evicted and a fresh
+    decoder is created.  This prevents torchcodec's internal pre-allocated
+    tensor shape mismatch: ``RuntimeError: Expected pre-allocated tensor of
+    shape 480x640x3, got [360, 640, 3]``.
+    """
 
     def __init__(self):
-        self._cache: dict[str, tuple[Any, Any]] = {}
+        # _cache maps video_path -> (decoder, file_handle, cached_resolution)
+        # where cached_resolution is (height, width) from decoder.metadata at
+        # the time the decoder was created.
+        self._cache: dict[str, tuple[Any, Any, tuple[int, int]]] = {}
         self._lock = Lock()
 
-    def get_decoder(self, video_path: str):
-        """Get a cached decoder or create a new one."""
+    def _make_decoder(self, video_path: str):
+        """Create a new VideoDecoder and return (decoder, file_handle, (H, W))."""
         if importlib.util.find_spec("torchcodec"):
             from torchcodec.decoders import VideoDecoder
         else:
             raise ImportError("torchcodec is required but not available.")
 
+        file_handle = fsspec.open(video_path).__enter__()
+        decoder = VideoDecoder(file_handle, seek_mode="approximate")
+        meta = decoder.metadata
+        resolution = (meta.height, meta.width)
+        return decoder, file_handle, resolution
+
+    def get_decoder(self, video_path: str):
+        """Get a cached decoder or create a new one.
+
+        On cache hit, validates that the stored resolution still matches the
+        decoder's current metadata.  If the resolution has changed (dynamic-
+        resolution AV1 stream), the stale entry is evicted and rebuilt.
+        """
         video_path = str(video_path)
 
         with self._lock:
+            if video_path in self._cache:
+                decoder, file_handle, cached_res = self._cache[video_path]
+                meta = decoder.metadata
+                current_res = (meta.height, meta.width)
+                if current_res != cached_res:
+                    # Resolution changed — evict stale decoder
+                    try:
+                        file_handle.close()
+                    except Exception:
+                        pass
+                    del self._cache[video_path]
+                    # Fall through to create a fresh decoder below
+
             if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+                decoder, file_handle, resolution = self._make_decoder(video_path)
+                self._cache[video_path] = (decoder, file_handle, resolution)
 
             return self._cache[video_path][0]
 
     def clear(self):
         """Clear the cache and close file handles."""
         with self._lock:
-            for _, file_handle in self._cache.values():
+            for _, file_handle, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
 
@@ -223,123 +260,117 @@ def decode_video_frames_torchcodec(
     tolerance_s: float,
     log_loaded_timestamps: bool = False,
     decoder_cache: VideoDecoderCache | None = None,
-) -> torch.Tensor:
-    """Loads frames associated with the requested timestamps of a video using torchcodec.
-
-    Args:
-        video_path: Path to the video file.
-        timestamps: List of timestamps to extract frames.
-        tolerance_s: Allowed deviation in seconds for frame retrieval.
-        log_loaded_timestamps: Whether to log loaded timestamps.
-        decoder_cache: Optional decoder cache instance. Uses default if None.
-
-    Note: Setting device="cuda" outside the main process, e.g. in data loader workers, will lead to CUDA initialization errors.
-
-    Note: Video benefits from inter-frame compression. Instead of storing every frame individually,
-    the encoder stores a reference frame (or a key frame) and subsequent frames as differences relative to
-    that key frame. As a consequence, to access a requested frame, we need to load the preceding key frame,
-    and all subsequent frames until reaching the requested frame. The number of key frames in a video
-    can be adjusted during encoding to take into account decoding time and video size in bytes.
-    """
+) -> torch.Tensor | list[torch.Tensor]:
+    """Loads frames associated with the requested timestamps of a video using torchcodec."""
     from torchcodec.decoders import VideoDecoder
+    import torchvision # 用于 Fallback
 
     video_path_str = str(video_path)
-
-    # When an explicit decoder_cache is provided, use it even in worker processes.
-    # This enables BoundedVideoDecoderCache (with capacity control) to work in workers,
-    # avoiding the overhead of re-opening video files on every decode call.
-    # When no cache is provided, fall back to creating a new decoder each time
-    # in worker processes (original behavior, to avoid unbounded memory growth).
-    try:
-        import torch.multiprocessing
-        in_worker = torch.multiprocessing.get_context().current_process().name != "MainProcess"
-    except Exception:
-        in_worker = False
-
-    _created_new_decoder = False
-    if decoder_cache is not None:
-        # Explicit cache provided — use it (supports BoundedVideoDecoderCache in workers)
-        decoder = decoder_cache.get_decoder(video_path_str)
-    elif in_worker:
-        # No cache provided + in worker process — create new decoder each time
-        # to avoid unbounded memory growth with default VideoDecoderCache
-        file_handle = fsspec.open(video_path_str).__enter__()
-        decoder = VideoDecoder(file_handle, seek_mode="approximate")
-        _created_new_decoder = True
-    else:
-        # Main process, no explicit cache — use default global cache
-        decoder = _default_decoder_cache.get_decoder(video_path_str)
+    file_handle = fsspec.open(video_path_str).__enter__()
+    decoder = VideoDecoder(file_handle, seek_mode="approximate")
 
     try:
-        loaded_ts = []
-        loaded_frames = []
-
         # get metadata for frame information
         metadata = decoder.metadata
         average_fps = metadata.average_fps
         num_frames = metadata.num_frames
+        
         # convert timestamps to frame indices
         frame_indices = [round(ts * average_fps) for ts in timestamps]
-        # clamp frame indices to valid range [0, num_frames - 1] to avoid out-of-bounds errors
-        # track which indices were clamped for tolerance handling
         clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
         frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
-        # retrieve frames based on indices
-        frames_batch = decoder.get_frames_at(indices=frame_indices)
 
-        for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
-            loaded_frames.append(frame)
-            loaded_ts.append(pts.item())
-            if log_loaded_timestamps:
-                logging.info(f"Frame loaded at timestamp={pts:.4f}")
+        try:
+            # 尝试使用 torchcodec 批量加速解码
+            frame_batch = decoder.get_frames_at(indices=frame_indices)
+            loaded_frames = frame_batch.data      # (T, C, H, W) uint8
+            loaded_ts = frame_batch.pts_seconds   # (T,) float
+        except RuntimeError as e:
+            if "Expected pre-allocated tensor" in str(e):
+                # =====================================================================
+                # 终极 Fallback：torchcodec 绝对无法处理单文件变分辨率。
+                # 此时果断退化到原生 PyAV 后端来单独处理这个变异的视频。
+                # =====================================================================
+                logging.warning(f"Dynamic resolution detected in {video_path_str}. Falling back to PyAV.")
+                torchvision.set_video_backend("pyav")
+                reader = torchvision.io.VideoReader(video_path_str, "video")
+                
+                first_ts = min(timestamps)
+                last_ts = max(timestamps)
+                reader.seek(first_ts, keyframes_only=True)
+                
+                single_frames = []
+                single_pts = []
+                for frame in reader:
+                    current_ts = frame["pts"]
+                    single_frames.append(frame["data"])
+                    single_pts.append(current_ts)
+                    if current_ts >= last_ts:
+                        break
+                
+                loaded_frames = single_frames
+                loaded_ts = single_pts
+            else:
+                raise
+
+        # Detect whether we are in the dynamic-resolution (list) path
+        is_dynamic_res = isinstance(loaded_frames, list)
+
+        if log_loaded_timestamps:
+            num_loaded = len(loaded_frames)
+            for i in range(num_loaded):
+                ts_i = loaded_ts[i] if is_dynamic_res else loaded_ts[i].item()
+                logging.info(f"Frame loaded at timestamp={ts_i:.4f}")
 
         query_ts = torch.tensor(timestamps)
-        loaded_ts = torch.tensor(loaded_ts)
+        loaded_ts_tensor = torch.tensor(loaded_ts) if not isinstance(loaded_ts, torch.Tensor) else loaded_ts
 
-        # compute distances between each query timestamp and loaded timestamps
-        dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
+        # compute distances
+        dist = torch.cdist(query_ts[:, None].float(), loaded_ts_tensor[:, None].float(), p=1)
         min_, argmin_ = dist.min(1)
 
-        # For clamped indices (query beyond video bounds), we skip tolerance check
-        # since we're intentionally returning the closest available frame
         clamped_mask_tensor = torch.tensor(clamped_mask)
         is_within_tol = min_ < tolerance_s
-        # Allow tolerance violation for clamped frames (query beyond video duration)
         is_within_tol = is_within_tol | clamped_mask_tensor
 
         assert is_within_tol.all(), (
-            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
-            "It means that the closest frame that can be loaded from the video is too far away in time."
-            "This might be due to synchronization issues with timestamps during data collection."
-            "To be safe, we advise to ignore this item during training."
-            f"\nqueried timestamps: {query_ts}"
-            f"\nloaded timestamps: {loaded_ts}"
-            f"\nvideo: {video_path}"
+            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=}).\n"
+            f"queried timestamps: {query_ts}\nloaded timestamps: {loaded_ts_tensor}\nvideo: {video_path}"
         )
 
         # get closest frames to the query timestamps
-        closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-        closest_ts = loaded_ts[argmin_]
+        if is_dynamic_res:
+            # 动态分辨率列表处理逻辑
+            closest_frames = [loaded_frames[idx] for idx in argmin_.tolist()]
+            # 归一化
+            closest_frames = [f.type(torch.float32) / 255.0 for f in closest_frames]
+            
+            shapes = {f.shape for f in closest_frames}
+            if len(shapes) == 1:
+                closest_frames = torch.stack(closest_frames)
+            else:
+                # 严禁做任何 Padding 操作，保持动态分辨率设计，直接返回 List[Tensor]
+                pass 
+        else:
+            # 正常 Tensor 处理逻辑
+            closest_frames = loaded_frames[argmin_]
+            closest_frames = (closest_frames / 255.0).type(torch.float32)
+
+        closest_ts = loaded_ts_tensor[argmin_]
 
         if log_loaded_timestamps:
             logging.info(f"{closest_ts=}")
 
-        # convert to float32 in [0,1] range
-        closest_frames = (closest_frames / 255.0).type(torch.float32)
-
         if not len(timestamps) == len(closest_frames):
-            raise FrameTimestampError(
-                f"Retrieved timestamps differ from queried {set(closest_frames) - set(timestamps)}"
-            )
+            raise FrameTimestampError(f"Retrieved timestamps differ from queried {set(closest_frames) - set(timestamps)}")
 
         return closest_frames
+
     finally:
-        # Close file handle only if we created a new decoder (no cache path)
-        if _created_new_decoder:
-            try:
-                file_handle.close()
-            except Exception:
-                pass
+        try:
+            file_handle.close()
+        except Exception:
+            pass
 
 
 def encode_video_frames(

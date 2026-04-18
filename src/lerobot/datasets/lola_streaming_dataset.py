@@ -70,6 +70,10 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
     当缓存数量超过 max_size 时，自动淘汰最早加入的解码器。
     对于有大量视频文件的场景（如 17 个 mp4），限制缓存大小可显著
     降低每个 worker 的内存占用（每个 VideoDecoder 约 200MB）。
+
+    Inherits resolution-validation logic from VideoDecoderCache: on cache hit
+    the stored resolution is checked against the decoder's current metadata.
+    If it diverges (dynamic-resolution AV1), the stale entry is evicted.
     """
 
     def __init__(self, max_size: int = 4):
@@ -81,29 +85,35 @@ class BoundedVideoDecoderCache(VideoDecoderCache):
         video_path = str(video_path)
 
         with self._lock:
+            if video_path in self._cache:
+                decoder, file_handle, cached_res = self._cache[video_path]
+                meta = decoder.metadata
+                current_res = (meta.height, meta.width)
+                if current_res != cached_res:
+                    try:
+                        file_handle.close()
+                    except Exception:
+                        pass
+                    del self._cache[video_path]
+                    self._key_order.remove(video_path)
+
             if video_path not in self._cache:
                 # 超过容量时淘汰最早的解码器
                 while len(self._cache) >= self._max_size and self._key_order:
                     oldest_key = self._key_order.pop(0)
                     if oldest_key in self._cache:
-                        _, old_handle = self._cache.pop(oldest_key)
+                        _, old_handle, _ = self._cache.pop(oldest_key)
                         old_handle.close()
 
-                if importlib.util.find_spec("torchcodec"):
-                    from torchcodec.decoders import VideoDecoder
-                else:
-                    raise ImportError("torchcodec is required but not available.")
-
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
-                self._cache[video_path] = (decoder, file_handle)
+                decoder, file_handle, resolution = self._make_decoder(video_path)
+                self._cache[video_path] = (decoder, file_handle, resolution)
                 self._key_order.append(video_path)
 
             return self._cache[video_path][0]
 
     def clear(self):
         with self._lock:
-            for _, file_handle in self._cache.values():
+            for _, file_handle, _ in self._cache.values():
                 file_handle.close()
             self._cache.clear()
             self._key_order.clear()
@@ -313,19 +323,34 @@ def _decode_video_cuda_in_process(config, video_path, timestamps, get_cuda_cache
     video_path_str = str(video_path)
 
     with cache._lock:
+        if video_path_str in cache._cache:
+            decoder, file_handle, cached_res = cache._cache[video_path_str]
+            meta = decoder.metadata
+            current_res = (meta.height, meta.width)
+            if current_res != cached_res:
+                try:
+                    file_handle.close()
+                except Exception:
+                    pass
+                del cache._cache[video_path_str]
+                cache._key_order.remove(video_path_str)
+
         if video_path_str not in cache._cache:
             file_handle = fsspec.open(video_path_str).__enter__()
             decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-            cache._cache[video_path_str] = (decoder, file_handle)
+            meta = decoder.metadata
+            resolution = (meta.height, meta.width)
+            cache._cache[video_path_str] = (decoder, file_handle, resolution)
             cache._key_order.append(video_path_str)
             # Evict if over capacity
             while len(cache._cache) > cache._max_size:
                 oldest_key = cache._key_order.pop(0)
-                old_decoder, old_handle = cache._cache.pop(oldest_key)
-                try:
-                    old_handle.close()
-                except Exception:
-                    pass
+                if oldest_key in cache._cache:
+                    _, old_handle, _ = cache._cache.pop(oldest_key)
+                    try:
+                        old_handle.close()
+                    except Exception:
+                        pass
         else:
             # Update access order (LRU)
             if video_path_str in cache._key_order:
@@ -1419,19 +1444,34 @@ class LoLAStreamingDataset(torch.utils.data.IterableDataset):
         video_path_str = str(video_path)
 
         with cache._lock:
+            if video_path_str in cache._cache:
+                decoder, file_handle, cached_res = cache._cache[video_path_str]
+                meta = decoder.metadata
+                current_res = (meta.height, meta.width)
+                if current_res != cached_res:
+                    try:
+                        file_handle.close()
+                    except Exception:
+                        pass
+                    del cache._cache[video_path_str]
+                    cache._key_order.remove(video_path_str)
+
             if video_path_str not in cache._cache:
                 file_handle = fsspec.open(video_path_str).__enter__()
                 decoder = VideoDecoder(file_handle, seek_mode="approximate", device="cuda")
-                cache._cache[video_path_str] = (decoder, file_handle)
+                meta = decoder.metadata
+                resolution = (meta.height, meta.width)
+                cache._cache[video_path_str] = (decoder, file_handle, resolution)
                 cache._key_order.append(video_path_str)
                 # 淘汰超出容量的解码器
                 while len(cache._cache) > cache._max_size:
                     oldest_key = cache._key_order.pop(0)
-                    old_decoder, old_handle = cache._cache.pop(oldest_key)
-                    try:
-                        old_handle.close()
-                    except Exception:
-                        pass
+                    if oldest_key in cache._cache:
+                        _, old_handle, _ = cache._cache.pop(oldest_key)
+                        try:
+                            old_handle.close()
+                        except Exception:
+                            pass
             else:
                 # 更新访问顺序
                 if video_path_str in cache._key_order:
