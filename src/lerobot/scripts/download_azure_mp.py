@@ -98,6 +98,6 @@ if __name__ == "__main__":
     directory_B = "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0412_v1/"         # 本地目标目录
     
     # 调整线程数（根据实际环境优化）
-    MAX_WORKERS = 128  # 云环境建议 16-32，普通PC建议 8-16
+    MAX_WORKERS = 32  # 云环境建议 16-32，普通PC建议 8-16
     
     recursive_copy_with_progress(directory_A, directory_B, max_workers=MAX_WORKERS)
