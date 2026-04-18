@@ -185,7 +185,13 @@ def _safe_concat(dfs: list) -> "pl.DataFrame":
 
 
 def _load_episodes_polars(root) -> list[dict]:
-    """Load episodes metadata via polars to avoid HF datasets CastError."""
+    """Load episodes metadata via polars to avoid HF datasets CastError.
+
+    Handles schema-inconsistent parquet files (e.g. files 000-045 that only
+    have stats/* columns and lack episode_index) by using diagonal concat,
+    then forcefully overwriting episode_index with a continuous 0..N-1 index
+    based on physical row count.
+    """
     import polars as pl
 
     episodes_dir = Path(root) / EPISODES_DIR
@@ -200,16 +206,41 @@ def _load_episodes_polars(root) -> list[dict]:
     for path in parquet_files:
         df = pl.scan_parquet(str(path)).collect()
         if df.height > 0:
-            non_stats_cols = [c for c in df.columns if not c.startswith("stats/")]
-            dfs.append(df.select(non_stats_cols))
+            dfs.append(df)
 
     if not dfs:
         return []
 
-    combined = pl.concat(dfs, how="diagonal")
-    combined = combined.sort("episode_index")
+    # Cast Int-type stats/ columns to Float64 to avoid SchemaError on concat
+    processed_dfs = []
+    for df in dfs:
+        cast_exprs = []
+        for c, t in zip(df.columns, df.dtypes):
+            if c.startswith("stats/"):
+                type_str = str(t)
+
+                # 情况 A：如果这是一个列表类型 (List)
+                if "List" in type_str:
+                    # 如果列表内部装的是整数或低精度浮点
+                    if "Int" in type_str or "Float32" in type_str:
+                        cast_exprs.append(pl.col(c).cast(pl.List(pl.Float64)))
+                # 情况 B：如果这是一个整数或低精度浮点
+                elif "Int" in type_str or "Float32" in type_str:
+                    cast_exprs.append(pl.col(c).cast(pl.Float64))
+        if cast_exprs:
+            df = df.with_columns(cast_exprs)
+        processed_dfs.append(df)
+
+    combined = pl.concat(processed_dfs, how="diagonal")
+
+    # Forcefully overwrite episode_index with continuous 0..N-1 range
+    if "episode_index" in combined.columns:
+        combined = combined.drop("episode_index")
+    combined = combined.with_row_index("episode_index")
 
     for col in combined.columns:
+        if col == "episode_index":
+            continue
         if col.endswith("/is_valid"):
             combined = combined.with_columns(pl.col(col).fill_null(0))
         elif combined[col].dtype in (pl.Int64, pl.Float64, pl.Int32, pl.Float32):
@@ -998,7 +1029,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
                 continue
             mean, std = stats[key]["mean"], stats[key]["std"]
 
-            if key == "action" and mean.shape[0] != self.action_dim:
+            if mean.shape[0] != self.action_dim:
                 if not temp_process:
                     raise ValueError(
                         f"Sub-dataset {self._sub_dataset_names[ds_idx]} has action dim "
