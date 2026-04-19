@@ -14,6 +14,7 @@ os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
 # 模块 1：环境准备与 AzCopy 安装
 # ==========================================
 def install_azcopy():
+    """在当前目录自动下载并解压 Linux 版 azcopy，若已存在则直接返回路径"""
     azcopy_path = "./azcopy"
     if os.path.exists(azcopy_path):
         return azcopy_path
@@ -23,6 +24,7 @@ def install_azcopy():
     tar_filename = "azcopy_linux.tar.gz"
     urllib.request.urlretrieve(tar_url, tar_filename)
 
+    # 从 tar 包中提取 azcopy 二进制文件
     extract_dir = ""
     with tarfile.open(tar_filename, "r:gz") as tar:
         for member in tar.getmembers():
@@ -41,11 +43,19 @@ def install_azcopy():
     return azcopy_path
 
 # ==========================================
-# 模块 2：解析 AzCopy 输出中的失败信息
+# 模块 2：解析 AzCopy 输出中的失败信息与传输统计
 # ==========================================
 def parse_transfer_result(output_lines):
+    """从 azcopy 输出中解析传输结果
+
+    Returns:
+        failed: 是否存在失败文件 (Failed > 0)
+        job_id: 本次传输的 JobId，用于断点续传
+        transferred_bytes: 已传输字节数
+    """
     failed = False
     job_id = None
+    transferred_bytes = 0
 
     for line in output_lines:
         line_str = line.strip()
@@ -60,28 +70,75 @@ def parse_transfer_result(output_lines):
         if m_job:
             job_id = m_job.group(1)
 
-    return failed, job_id
+        # 匹配传输字节数，如 "Transferred: 1.234 GiB / 5.678 GiB" 或 "1.234 GiB Transferred"
+        m_bytes = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)\s*(?:/|Transferred)', line_str, re.IGNORECASE)
+        if m_bytes:
+            transferred_bytes = _parse_size_to_bytes(m_bytes.group(1), m_bytes.group(2))
+
+    return failed, job_id, transferred_bytes
+
+def _parse_size_to_bytes(value_str, unit_str):
+    """将 '1.23 GiB' 这类字符串转换为字节数"""
+    value = float(value_str)
+    unit_map = {
+        'B': 1,
+        'KiB': 1024, 'KB': 1024,
+        'MiB': 1024**2, 'MB': 1024**2,
+        'GiB': 1024**3, 'GB': 1024**3,
+        'TiB': 1024**4, 'TB': 1024**4,
+    }
+    return int(value * unit_map.get(unit_str, 1))
+
+def _format_bytes(num_bytes):
+    """将字节数格式化为人类可读的字符串，如 '1.23 GiB'"""
+    for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PiB"
+
+def _format_duration(seconds):
+    """将秒数格式化为 HH:MM:SS 或 MM:SS"""
+    secs = int(seconds)
+    hrs, remainder = divmod(secs, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hrs > 0:
+        return f"{hrs:d}:{mins:02d}:{secs:02d}"
+    return f"{mins:d}:{secs:02d}"
 
 def _wait_with_countdown(seconds):
+    """倒计时等待，用于重试间隔"""
     for i in range(seconds, 0, -1):
         print(f"\r  ⏳ {i} 秒后重试...", end="", flush=True)
         time.sleep(1)
     print("\r  " + " " * 30 + "\r", end="", flush=True)
 
 # ==========================================
-# 模块 3：调用 AzCopy 执行精准传输（单循环扁平化设计）
+# 模块 3：调用 AzCopy 执行精准传输（单循环扁平化设计 + 计时统计）
 # ==========================================
 MAX_RETRIES = 5
 RETRY_DELAY_SECONDS = 10
 
 def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MAX_RETRIES):
+    """执行 AzCopy 传输，支持断点续传与失败重试
+
+    传输策略（单循环扁平化）：
+      - 有 JobId 时 → azcopy jobs resume（断点续传，不重传已完成文件）
+      - 无 JobId + 首次 → azcopy copy（全量拉取）
+      - 无 JobId + 重试 → azcopy copy --overwrite=ifSourceNewer（智能对比续传，
+        仅下载源端更新的文件，跳过本地已有的相同文件）
+
+    成功判定：退出码 == 0 且 Failed 文件数 == 0
+    """
     print(f"\n🚀 开始通过 AzCopy 直连拉取至: {destination_path}")
     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
 
     current_job_id = None
+    task_start_time = time.time()  # 整个任务的总计时起点
 
     for attempt in range(1, max_retries + 1):
         output_lines = []
+        attempt_start_time = time.time()  # 单次尝试的计时起点
 
         # 根据是否有 JobId 决定是 Copy 还是 Resume
         if current_job_id:
@@ -92,6 +149,7 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
                 print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 执行初始全量拉取")
                 command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true"]
             else:
+                # 无 JobId 被迫全量重试时，加上覆盖保护，避免重复下载已有文件
                 print(f"\n⚠️ [第 {attempt}/{max_retries} 次尝试] 无 JobId，退回智能对比续传模式")
                 command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true", "--overwrite=ifSourceNewer"]
 
@@ -103,22 +161,38 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
                 print(f"    {line.strip()}")
 
         process.wait()
+        attempt_elapsed = time.time() - attempt_start_time  # 单次尝试耗时
 
-        failed, new_job_id = parse_transfer_result(output_lines)
+        # 解析本次运行的结果
+        failed, new_job_id, transferred_bytes = parse_transfer_result(output_lines)
 
         # 更新 JobId，供下一次重试使用
         if new_job_id:
             current_job_id = new_job_id
 
+        # 输出本次尝试的计时与速度统计
+        speed = transferred_bytes / attempt_elapsed if attempt_elapsed > 0 else 0
+        print(f"    ⏱  本次耗时: {_format_duration(attempt_elapsed)}  |  "
+              f"传输量: {_format_bytes(transferred_bytes)}  |  "
+              f"速度: {_format_bytes(speed)}/s")
+
+        # 判断是否彻底成功
         if process.returncode == 0 and not failed:
+            total_elapsed = time.time() - task_start_time
+            total_speed = transferred_bytes / total_elapsed if total_elapsed > 0 else 0
             print(f"✅ 目录 {destination_path} 拉取彻底成功！")
+            print(f"    ⏱  总耗时: {_format_duration(total_elapsed)}  |  "
+                  f"总传输量: {_format_bytes(transferred_bytes)}  |  "
+                  f"平均速度: {_format_bytes(total_speed)}/s")
             return True
         else:
             print(f"❌ 尝试结束，存在瑕疵 (退出码: {process.returncode}, JobId: {current_job_id})")
             if attempt < max_retries:
                 _wait_with_countdown(RETRY_DELAY_SECONDS)
 
+    total_elapsed = time.time() - task_start_time
     print(f"🚨 目录 {destination_path} 在 {max_retries} 次尝试后仍然失败。")
+    print(f"    ⏱  总耗时: {_format_duration(total_elapsed)}")
     return False
 
 
@@ -140,7 +214,10 @@ if __name__ == "__main__":
         },
     ]
 
+    # 登录 Azure Managed Identity
     subprocess.run([azcopy_bin, "login", "--identity"], check=True)
+
+    global_start = time.time()
 
     failed_tasks = []
     for task in tasks:
@@ -149,9 +226,13 @@ if __name__ == "__main__":
         if not success:
             failed_tasks.append(task)
 
+    global_elapsed = time.time() - global_start
+
     if failed_tasks:
         print(f"\n❌ 以下 {len(failed_tasks)} 个任务在所有重试后仍失败：")
         for t in failed_tasks:
             print(f"  - {t['cloud_path']}")
     else:
         print("\n🎉 所有指定数据集已安全、极速地抵达本地存储！")
+
+    print(f"\n⏱  全局总耗时: {_format_duration(global_elapsed)}")
