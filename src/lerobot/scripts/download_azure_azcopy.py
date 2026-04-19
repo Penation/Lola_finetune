@@ -52,30 +52,52 @@ def parse_transfer_result(output_lines):
         failed: 是否存在失败文件 (Failed > 0)
         job_id: 本次传输的 JobId，用于断点续传
         transferred_bytes: 已传输字节数
+        throughput_bytes_per_sec: 实时吞吐速度 (bytes/s)，来自进度行
     """
     failed = False
     job_id = None
     transferred_bytes = 0
+    throughput_bytes_per_sec = 0
 
     for line in output_lines:
         line_str = line.strip()
 
-        # 匹配 "Number of Transfers Failed: 1" 或 "Failed: 1"
-        m_fail = re.search(r'Failed:\s*(\d+)', line_str)
+        # 匹配进度行 "75.7 %, 12017 Done, 1 Failed, 3474 Pending, 0 Skipped, 15492 Total, 2-sec Throughput (Mb/s): 2904.1843"
+        m_progress = re.search(r'(\d+)\s+Failed', line_str)
+        if m_progress and int(m_progress.group(1)) > 0:
+            failed = True
+
+        # 匹配进度行中的实时吞吐 "Throughput (Mb/s): 2904.1843"
+        m_throughput = re.search(r'Throughput\s*\((\w+)/s\):\s*([\d.]+)', line_str)
+        if m_throughput:
+            throughput_unit = m_throughput.group(1)
+            throughput_val = float(m_throughput.group(2))
+            unit_map = {'b': 1/8, 'B': 1, 'Kb': 1e3/8, 'KB': 1e3,
+                        'Mb': 1e6/8, 'MB': 1e6, 'Gb': 1e9/8, 'GB': 1e9}
+            throughput_bytes_per_sec = throughput_val * unit_map.get(throughput_unit, 1)
+
+        # 匹配 "Number of File Transfers Failed: 1"
+        m_fail = re.search(r'Number of File Transfers Failed:\s*(\d+)', line_str)
         if m_fail and int(m_fail.group(1)) > 0:
             failed = True
 
-        # 匹配 JobId: xxxxxxxx-xxxx-...
-        m_job = re.search(r'[Jj]ob\s*[Ii][Dd]\s*[:\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', line_str)
+        # 匹配 "Job 64cdbc89-733e-4541-5cdf-03e8bef16519 has started"
+        m_job = re.search(r'Job\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', line_str)
         if m_job:
             job_id = m_job.group(1)
 
-        # 匹配传输字节数，如 "Transferred: 1.234 GiB / 5.678 GiB" 或 "1.234 GiB Transferred"
-        m_bytes = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)\s*(?:/|Transferred)', line_str, re.IGNORECASE)
-        if m_bytes:
-            transferred_bytes = _parse_size_to_bytes(m_bytes.group(1), m_bytes.group(2))
+        # 匹配 "Total Number of Bytes Transferred: 1394255917"（精确字节数，优先）
+        m_bytes_exact = re.search(r'Total Number of Bytes Transferred:\s*(\d+)', line_str)
+        if m_bytes_exact:
+            transferred_bytes = int(m_bytes_exact.group(1))
 
-    return failed, job_id, transferred_bytes
+        # 兼容旧格式 "Transferred: 1.234 GiB / 5.678 GiB"
+        if not m_bytes_exact:
+            m_bytes = re.search(r'([\d.]+)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)\s*(?:/|Transferred)', line_str, re.IGNORECASE)
+            if m_bytes:
+                transferred_bytes = _parse_size_to_bytes(m_bytes.group(1), m_bytes.group(2))
+
+    return failed, job_id, transferred_bytes, throughput_bytes_per_sec
 
 def _parse_size_to_bytes(value_str, unit_str):
     """将 '1.23 GiB' 这类字符串转换为字节数"""
@@ -157,14 +179,14 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
 
         for line in process.stdout:
             output_lines.append(line)
-            if "Done" in line or "Transferred" in line or "Failed" in line or "%" in line or "JobId" in line:
+            if any(kw in line for kw in ("Done", "Transferred", "Failed", "%", "Job ", "Elapsed", "summary", "Status")):
                 print(f"    {line.strip()}")
 
         process.wait()
         attempt_elapsed = time.time() - attempt_start_time  # 单次尝试耗时
 
         # 解析本次运行的结果
-        failed, new_job_id, transferred_bytes = parse_transfer_result(output_lines)
+        failed, new_job_id, transferred_bytes, throughput = parse_transfer_result(output_lines)
 
         # 更新 JobId，供下一次重试使用
         if new_job_id:
@@ -172,9 +194,10 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
 
         # 输出本次尝试的计时与速度统计
         speed = transferred_bytes / attempt_elapsed if attempt_elapsed > 0 else 0
+        speed_display = f"{_format_bytes(throughput)}/s" if throughput > 0 else f"{_format_bytes(speed)}/s"
         print(f"    ⏱  本次耗时: {_format_duration(attempt_elapsed)}  |  "
               f"传输量: {_format_bytes(transferred_bytes)}  |  "
-              f"速度: {_format_bytes(speed)}/s")
+              f"速度: {speed_display}")
 
         # 判断是否彻底成功
         if process.returncode == 0 and not failed:
