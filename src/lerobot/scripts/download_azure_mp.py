@@ -189,8 +189,8 @@ if __name__ == "__main__":
         ),
     ]
     
-    # 🌟 关键修改：针对均值 175MB 的大文件数据集，16 并发足以吃满网卡带宽，同时防止 Blobfuse 撑爆系统内存 (Exit Code 137)
-    MAX_WORKERS = 16 
+    # 🌟 关键修改：针对均值 175MB 的大文件数据集，8 并发足以吃满网卡带宽，同时防止 Blobfuse 撑爆系统内存 (Exit Code 137)
+    MAX_WORKERS = 8
     
     # 3. 顺序执行拉取任务
     for src, dst in directories:
