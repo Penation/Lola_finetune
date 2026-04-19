@@ -89,7 +89,7 @@ def start_real_baseline_training():
     print("[系统初始化] 所有 GPU 的基线训练循环已启动。\n")
 
 # ==========================================
-# 模块 2：高性能数据并行拉取 (防 OOM 大文件专版)
+# 模块 2：防爆缓存的智能分批复制
 # ==========================================
 class ThreadSafeTqdm:
     def __init__(self, total, desc):
@@ -112,16 +112,11 @@ class ThreadSafeTqdm:
         self.pbar.close()
 
 def copy_file_task(args):
-    """单文件复制任务：无判断直接覆写，大缓冲加速"""
     src_file, dst_file, progress = args
     try:
-        # 使用 16MB 大缓冲读取，减少系统调用次数
         with open(src_file, 'rb') as fsrc, open(dst_file, 'wb') as fdst:
             shutil.copyfileobj(fsrc, fdst, length=16*1024*1024)
-        
-        # 保留元数据
         shutil.copystat(src_file, dst_file)
-        
         progress.update_success()
         return 'success'
     except Exception as e:
@@ -129,51 +124,79 @@ def copy_file_task(args):
         progress.update_fail()
         return 'fail'
 
-def recursive_copy_with_progress(src_root: str, dst_root: str, max_workers: int):
-    src_path = Path(src_root).resolve()
-    dst_path = Path(dst_root).resolve()
+def smart_batch_copy(directories, max_workers=8):
+    all_files_with_size = []
+    total_bytes_all = 0
     
-    if not src_path.exists():
-        raise FileNotFoundError(f"源目录不存在: {src_root}")
-    
-    all_files = []
-    
-    print(f"正在扫描目录结构并预创建文件夹: {src_path} ...")
-    # 提前在主线程建好目录树，子线程只负责无脑写文件，消除锁竞争
-    for root, dirs, files in os.walk(str(src_path)):
-        current_src_dir = Path(root)
-        rel_dir = current_src_dir.relative_to(src_path)
-        current_dst_dir = dst_path / rel_dir
+    print("正在扫描所有目录并计算文件物理大小，请稍候...")
+    for src_root, dst_root in directories:
+        src_path = Path(src_root).resolve()
+        dst_path = Path(dst_root).resolve()
         
-        current_dst_dir.mkdir(parents=True, exist_ok=True)
-        
-        for file in files:
-            src_file = current_src_dir / file
-            dst_file = current_dst_dir / file
-            all_files.append((src_file, dst_file))
-    
-    total_files = len(all_files)
-    if total_files == 0:
-        print("没有发现需要复制的文件。")
-        return
-    
-    print(f"发现 {total_files} 个文件，开始多线程复制 (并发数: {max_workers})...")
-    progress = ThreadSafeTqdm(total=total_files, desc=f"复制 {src_path.name}")
-    
-    # 采用生成器，避免任务过多时 Future 对象撑爆内存
-    task_args = ((src, dst, progress) for src, dst in all_files)
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        list(executor.map(copy_file_task, task_args, chunksize=10))
-    
-    progress.close()
-    
-    print(f"\n[{src_path.name}] 任务结束报告:")
-    print(f"✅ 成功复制: {progress.success_count}/{total_files}")
-    if progress.fail_count > 0:
-        print(f"❌ 失败报错: {progress.fail_count}")
-    print("-" * 50)
+        if not src_path.exists():
+            print(f"⚠️ 跳过不存在的源目录: {src_root}")
+            continue
+            
+        for root, _, files in os.walk(str(src_path)):
+            current_src_dir = Path(root)
+            rel_dir = current_src_dir.relative_to(src_path)
+            current_dst_dir = dst_path / rel_dir
+            current_dst_dir.mkdir(parents=True, exist_ok=True)
+            
+            for file in files:
+                src_file = current_src_dir / file
+                dst_file = current_dst_dir / file
+                # 获取文件的真实大小
+                size = src_file.stat().st_size
+                all_files_with_size.append((src_file, dst_file, size))
+                total_bytes_all += size
 
+    total_files = len(all_files_with_size)
+    if total_files == 0:
+        print("未发现任何需要复制的文件。")
+        return
+        
+    print(f"扫描完毕！共计 {total_files} 个文件，总容量: {total_bytes_all / (1024**3):.2f} GB")
+    
+    # 🌟 核心防爆参数：当本批次复制达到 1TB 时，强制停止
+    BATCH_LIMIT_BYTES = 1024 * 1024**3 
+    
+    progress = ThreadSafeTqdm(total=total_files, desc="总进度")
+    
+    current_batch_args = []
+    current_batch_size = 0
+    batch_index = 1
+    
+    # 执行一个批次的封装函数
+    def execute_batch(batch_args, b_size, b_idx):
+        print(f"\n🚀 开始执行第 {b_idx} 批次，本批次容量: {b_size / (1024**3):.2f} GB")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(executor.map(copy_file_task, batch_args))
+    
+    for src, dst, size in all_files_with_size:
+        current_batch_args.append((src, dst, progress))
+        current_batch_size += size
+        
+        # 当累积到 800GB 时，提交任务并休眠排空
+        if current_batch_size >= BATCH_LIMIT_BYTES:
+            execute_batch(current_batch_args, current_batch_size, batch_index)
+            
+            # 🔥 强制排空机制：休眠 120 秒，给 Blobfuse 垃圾回收时间
+            print("\n⏳ [防爆保护] 已到达 800GB 阈值。暂停拉取 120 秒，等待 Blobfuse 底层排空缓存...")
+            for remaining in range(120, 0, -10):
+                print(f"   距离恢复还剩 {remaining} 秒...")
+                time.sleep(10)
+                
+            current_batch_args = []
+            current_batch_size = 0
+            batch_index += 1
+            
+    # 执行最后剩下的小于 800GB 的尾巴批次
+    if current_batch_args:
+        execute_batch(current_batch_args, current_batch_size, batch_index)
+        
+    progress.close()
+    print(f"\n🎉 全部复制任务安全完成! 成功: {progress.success_count}/{total_files}")
 # ==========================================
 # 模块 3：主执行逻辑
 # ==========================================
@@ -193,5 +216,4 @@ if __name__ == "__main__":
     MAX_WORKERS = 8
     
     # 3. 顺序执行拉取任务
-    for src, dst in directories:
-        recursive_copy_with_progress(src, dst, max_workers=MAX_WORKERS)
+    smart_batch_copy(directories, max_workers=MAX_WORKERS)
