@@ -5,8 +5,8 @@ import urllib.request
 import tarfile
 import argparse
 
-# 🌟 强制设置 AzCopy 使用 Azure CLI 身份验证
-os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "AZCLI"
+# 🌟 强制设置 AzCopy 使用 Managed Identity 身份验证
+os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
 
 # ==========================================
 # 模块 1：环境准备与 AzCopy 安装
@@ -89,6 +89,9 @@ if __name__ == "__main__":
             "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0412_v1/"
         },
     ]
+    
+    # 进行登录操作
+    subprocess.run([azcopy_bin, "login", "--identity"], check=True)
 
     for task in tasks:
         # 直接拼接 URL
