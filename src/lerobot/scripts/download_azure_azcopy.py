@@ -7,6 +7,7 @@ import argparse
 import re
 import time
 import threading
+import datetime
 
 # 🌟 强制设置 AzCopy 使用 Managed Identity 身份验证
 os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
@@ -247,8 +248,9 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
 
         for line in process.stdout:
             output_lines.append(line)
+            format_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if any(kw in line for kw in ("Done", "Transferred", "Failed", "%", "Job ", "Elapsed", "summary", "Status")):
-                print(f"    {line.strip()}")
+                print(f"[{format_time}]:  {line.strip()}")
 
         process.wait()
         attempt_elapsed = time.time() - attempt_start_time  # 单次尝试耗时
