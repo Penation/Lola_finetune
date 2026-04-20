@@ -13,11 +13,11 @@ os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
 
 # 1. 控制并发数：对于 175MB 的大文件，64 到 128 是最能跑满网络带宽且不会触发限流的甜点区间。
 # 可以先 "AUTO" (让它自己动态调)，或者强制锁定为一个固定值，如 "96" (与 CPU 核心数 1:1)
-os.environ["AZCOPY_CONCURRENCY_VALUE"] = "32" 
+# os.environ["AZCOPY_CONCURRENCY_VALUE"] = "32" 
 
 # 2. 扩大内存缓冲：对于 399GB 的超大共享内存。
 # 默认情况下 azcopy 会动态占用，为了让网络到 NVMe 盘的写入极其丝滑，直接给它分配 8GB 的专属物理内存缓冲
-os.environ["AZCOPY_BUFFER_GB"] = "8"
+# os.environ["AZCOPY_BUFFER_GB"] = "8"
 
 # ==========================================
 # 模块 0：轻度 GPU 负载保活 (防 Suspended)
