@@ -206,8 +206,9 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
     """执行 AzCopy 传输，支持断点续传与失败重试
 
     传输策略（单循环扁平化）：
-      - 有 JobId 时 → azcopy jobs resume（断点续传，不重传已完成文件）
-      - 无 JobId + 首次 → azcopy copy（全量拉取）
+      - 首次 → azcopy copy（全量拉取）
+      - 有 JobId 时 → azcopy jobs resume（断点续传）
+        但如果 resume 仍然失败，丢弃 JobId，退回 copy 模式
       - 无 JobId + 重试 → azcopy copy --overwrite=ifSourceNewer（智能对比续传，
         仅下载源端更新的文件，跳过本地已有的相同文件）
 
@@ -217,23 +218,29 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
     os.makedirs(os.path.dirname(destination_path), exist_ok=True)
 
     current_job_id = None
+    resume_attempted = False  # 是否已经尝试过 jobs resume
     task_start_time = time.time()  # 整个任务的总计时起点
 
     for attempt in range(1, max_retries + 1):
         output_lines = []
         attempt_start_time = time.time()  # 单次尝试的计时起点
 
-        # 根据是否有 JobId 决定是 Copy 还是 Resume
-        if current_job_id:
-            print(f"\n🔄 [第 {attempt}/{max_retries} 次尝试] 启动极速断点续传 (JobId: {current_job_id})")
+        # 决定传输模式
+        if current_job_id and not resume_attempted:
+            # 仅尝试一次 jobs resume；如果 resume 仍然失败，丢弃 JobId 退回 copy
+            print(f"\n🔄 [第 {attempt}/{max_retries} 次尝试] 启动断点续传 (JobId: {current_job_id})")
             command = [azcopy_bin, "jobs", "resume", current_job_id]
+            resume_attempted = True
         else:
+            # 丢弃 JobId：resume 无效或首次/重试，使用 copy 模式
+            if current_job_id:
+                print(f"\n⚠️ [第 {attempt}/{max_retries} 次尝试] 断点续传仍失败，丢弃 JobId，退回智能对比续传模式")
+                current_job_id = None
             if attempt == 1:
                 print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 执行初始全量拉取")
                 command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true"]
             else:
-                # 无 JobId 被迫全量重试时，加上覆盖保护，避免重复下载已有文件
-                print(f"\n⚠️ [第 {attempt}/{max_retries} 次尝试] 无 JobId，退回智能对比续传模式")
+                print(f"\n📥 [第 {attempt}/{max_retries} 次尝试] 智能对比续传 (--overwrite=ifSourceNewer)")
                 command = [azcopy_bin, "copy", source_url, destination_path, "--recursive=true", "--overwrite=ifSourceNewer"]
 
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -270,7 +277,10 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
                   f"平均速度: {_format_bytes(total_speed)}/s")
             return True
         else:
-            print(f"❌ 尝试结束，存在瑕疵 (退出码: {process.returncode}, JobId: {current_job_id})")
+            # resume 失败时丢弃 JobId，下次循环自动退回 copy 模式
+            if resume_attempted and current_job_id:
+                current_job_id = None
+            print(f"❌ 尝试结束，存在瑕疵 (退出码: {process.returncode})")
             if attempt < max_retries:
                 _wait_with_countdown(RETRY_DELAY_SECONDS)
 
