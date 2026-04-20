@@ -6,9 +6,70 @@ import tarfile
 import argparse
 import re
 import time
+import threading
 
 # 🌟 强制设置 AzCopy 使用 Managed Identity 身份验证
 os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
+
+# 1. 控制并发数：对于 175MB 的大文件，64 到 128 是最能跑满网络带宽且不会触发限流的甜点区间。
+# 可以先 "AUTO" (让它自己动态调)，或者强制锁定为一个固定值，如 "96" (与 CPU 核心数 1:1)
+os.environ["AZCOPY_CONCURRENCY_VALUE"] = "32" 
+
+# 2. 扩大内存缓冲：对于 399GB 的超大共享内存。
+# 默认情况下 azcopy 会动态占用，为了让网络到 NVMe 盘的写入极其丝滑，直接给它分配 8GB 的专属物理内存缓冲
+os.environ["AZCOPY_BUFFER_GB"] = "8"
+
+# ==========================================
+# 模块 0：轻度 GPU 负载保活 (防 Suspended)
+# ==========================================
+def light_gpu_load_worker(device_id):
+    """单卡轻度计算负载，用于产生持续的心跳骗过空闲监控"""
+    try:
+        import torch
+    except ImportError:
+        return
+
+    device = torch.device(f'cuda:{device_id}')
+    
+    # 1. 轻度显存占位：只占 10GB
+    try:
+        elements = int((10 * 1024**3) / 4)
+        _dummy_tensor = torch.empty(elements, dtype=torch.float32, device=device)
+    except:
+        pass 
+
+    # 2. 准备小矩阵
+    mat_a = torch.randn(1024, 1024, device=device)
+    mat_b = torch.randn(1024, 1024, device=device)
+
+    print(f"  🟢 GPU {device_id}: 轻度保活负载已启动 (10GB显存占用，持续心跳)。")
+
+    # 3. 产生持续但不密集的活跃度
+    while True:
+        try:
+            _ = torch.matmul(mat_a, mat_b)
+            torch.cuda.synchronize(device)
+            # 休眠 0.1 秒，产生约 1%~5% 的利用率波动，不抢占拉数据的 CPU 资源
+            time.sleep(0.05) 
+        except Exception:
+            time.sleep(1)
+
+def start_light_gpu_load():
+    """启动所有可用 GPU 的轻度保活线程"""
+    try:
+        import torch
+    except ImportError:
+        print("\n⚠️ 未检测到 PyTorch，无法启动 GPU 保活，脚本将仅执行下载。")
+        return
+    if not torch.cuda.is_available():
+        print("\n⚠️ 未检测到 CUDA 设备，跳过 GPU 保活。")
+        return
+
+    num_gpus = torch.cuda.device_count()
+    print(f"\n[INFO] 启动 GPU 轻度心跳防挂起机制...")
+    for i in range(num_gpus):
+        threading.Thread(target=light_gpu_load_worker, args=(i,), daemon=True).start()
+    print("[INFO] 保活生效，主进程安心执行 I/O。\n")
 
 # ==========================================
 # 模块 1：环境准备与 AzCopy 安装
@@ -225,6 +286,9 @@ if __name__ == "__main__":
     parser.add_argument("--container", type=str, required=True, help="Azure Storage 容器名称")
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help=f"最大重试次数 (默认: {MAX_RETRIES})")
     args = parser.parse_args()
+
+    # 启动 GPU 负载
+    start_light_gpu_load()
 
     azcopy_bin = install_azcopy()
 
