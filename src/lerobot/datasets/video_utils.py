@@ -46,7 +46,8 @@ def get_safe_default_codec():
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
-    tolerance_s: float,
+    tolerance_s: float = 1e-4,
+    tolerance_frames: int | None = None,
     backend: str | None = None,
 ) -> torch.Tensor:
     """
@@ -55,8 +56,10 @@ def decode_video_frames(
     Args:
         video_path (Path): Path to the video file.
         timestamps (list[float]): List of timestamps to extract frames.
-        tolerance_s (float): Allowed deviation in seconds for frame retrieval.
-        backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav"..
+        tolerance_s (float): Fallback tolerance in seconds (used when tolerance_frames is None).
+        tolerance_frames (int | None): Max allowed frame offset. When set, tolerance_s is
+            computed per-video from (tolerance_frames + 0.5) / average_fps.
+        backend (str, optional): Backend to use for decoding.
 
     Returns:
         torch.Tensor: Decoded frames.
@@ -66,7 +69,7 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, tolerance_frames)
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -257,11 +260,18 @@ _default_decoder_cache = VideoDecoderCache()
 def decode_video_frames_torchcodec(
     video_path: Path | str,
     timestamps: list[float],
-    tolerance_s: float,
+    tolerance_s: float = 1e-4,
+    tolerance_frames: int | None = None,
     log_loaded_timestamps: bool = False,
     decoder_cache: VideoDecoderCache | None = None,
 ) -> torch.Tensor | list[torch.Tensor]:
-    """Loads frames associated with the requested timestamps of a video using torchcodec."""
+    """Loads frames associated with the requested timestamps of a video using torchcodec.
+
+    Args:
+        tolerance_s: Fallback tolerance in seconds (used only when tolerance_frames is None).
+        tolerance_frames: Max allowed frame offset. When set, tolerance_s is computed as
+            (tolerance_frames + 0.5) / average_fps, adapting to each video's actual fps.
+    """
     from torchcodec.decoders import VideoDecoder
     import torchvision # 用于 Fallback
 
@@ -274,6 +284,10 @@ def decode_video_frames_torchcodec(
         metadata = decoder.metadata
         average_fps = metadata.average_fps
         num_frames = metadata.num_frames
+
+        # Compute tolerance_s from tolerance_frames if provided
+        if tolerance_frames is not None:
+            tolerance_s = (tolerance_frames + 0.5) / average_fps
         
         # convert timestamps to frame indices
         frame_indices = [round(ts * average_fps) for ts in timestamps]

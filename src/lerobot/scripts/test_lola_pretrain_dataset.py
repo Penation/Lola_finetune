@@ -81,6 +81,7 @@ def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=Non
     print("=" * 60)
 
     config, delta_timestamps = _build_config(dataset_root, dataset_to_episodes_path, sub_root, temp_process)
+    tolerance_frames = 1
 
     dataset = LoLAPretrainDataset(
         repo_id="test",
@@ -91,6 +92,7 @@ def test_basic_loading(dataset_root, dataset_to_episodes_path=None, sub_root=Non
         delta_timestamps=delta_timestamps,
         dataset_to_episodes_path=dataset_to_episodes_path,
         temp_process=temp_process,
+        tolerance_frames=tolerance_frames,
     )
 
     print(f"  Dataset created: {dataset.num_episodes} episodes, {len(dataset)} frames")

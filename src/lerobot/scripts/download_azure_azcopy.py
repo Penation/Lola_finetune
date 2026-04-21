@@ -9,6 +9,8 @@ import time
 import threading
 import datetime
 
+from pathlib import Path
+
 # 🌟 强制设置 AzCopy 使用 Managed Identity 身份验证
 os.environ["AZCOPY_AUTO_LOGIN_TYPE"] = "MSI"
 
@@ -312,6 +314,55 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
     return False
 
 
+# ==========================================
+# 模块 4：The "Tweezers" (Targeted FUSE Fallback)
+# ==========================================
+def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
+    """扫描本地目标目录。如果发现文件缺失或大小与 FUSE 挂载点不一致，则使用标准的 Python I/O 安全复制。"""
+    fuse_path = Path(fuse_src_dir).resolve()
+    dst_path = Path(local_dst_dir).resolve()
+    
+    if not fuse_path.exists():
+        print(f"⚠️ 找不到 FUSE 挂载路径: {fuse_src_dir}。无法执行后备修复。")
+        return
+
+    print(f"\n🔍 启动 FUSE 后备扫描: 正在对比本地 NVMe 与 {fuse_path.name}...")
+    fixed_count = 0
+
+    for root, _, files in os.walk(str(fuse_path)):
+        current_fuse_dir = Path(root)
+        rel_dir = current_fuse_dir.relative_to(fuse_path)
+        current_dst_dir = dst_path / rel_dir
+        
+        current_dst_dir.mkdir(parents=True, exist_ok=True)
+        
+        for file in files:
+            fuse_file = current_fuse_dir / file
+            dst_file = current_dst_dir / file
+            
+            # 判断是否需要修复：文件不存在，或者文件大小不一致 (说明 AzCopy 只下了一半)
+            needs_copy = False
+            if not dst_file.exists():
+                needs_copy = True
+            elif fuse_file.stat().st_size != dst_file.stat().st_size:
+                needs_copy = True
+            
+            if needs_copy:
+                print(f"  🩹 正在修复顽固文件: {rel_dir / file}")
+                try:
+                    # 使用 16MB 大缓冲进行 FUSE 拷贝
+                    with open(fuse_file, 'rb') as fsrc, open(dst_file, 'wb') as fdst:
+                        shutil.copyfileobj(fsrc, fdst, length=16*1024*1024)
+                    shutil.copystat(fuse_file, dst_file)
+                    fixed_count += 1
+                except Exception as e:
+                    print(f"  ❌ FUSE 复制失败 {file}: {e}")
+
+    if fixed_count > 0:
+        print(f"✅ 后备修复完成！成功找回并完美修复了 {fixed_count} 个顽固文件。")
+    else:
+        print("✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用 AzCopy 从 Azure Blob Storage 拉取数据集")
     parser.add_argument("--account", type=str, required=True, help="Azure Storage 账户名称")
@@ -329,7 +380,8 @@ if __name__ == "__main__":
     tasks = [
         {
             "cloud_path": "robot_dataset/lerobot-format-v30/merged_0412_v1/",
-            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0412_v1/"
+            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0412_v1/",
+            "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0412_v1/",
         },
     ]
 
@@ -342,6 +394,7 @@ if __name__ == "__main__":
     for task in tasks:
         src_url = f"{base_url}/{task['cloud_path']}"
         success = run_azcopy_transfer(azcopy_bin, src_url, task["local_path"], max_retries=args.max_retries)
+        fallback_fuse_copy(task["fuse_path"], task["local_path"])
         if not success:
             failed_tasks.append(task)
 

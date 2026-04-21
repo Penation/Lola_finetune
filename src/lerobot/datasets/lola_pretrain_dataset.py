@@ -412,6 +412,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         image_transforms=None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 1e-4,
+        tolerance_frames: int | None = None,
         revision: str | None = None,
         force_cache_sync: bool = False,
         decode_device: str = "cpu",
@@ -429,7 +430,9 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             episodes: Optional list of episode indices to load (not yet implemented).
             image_transforms: Image transforms (unused, Qwen3.5 processor handles).
             delta_timestamps: Timestamp offset config for lookback/lookahead.
-            tolerance_s: Timestamp tolerance for video decode.
+            tolerance_s: Fallback timestamp tolerance in seconds (used when tolerance_frames is None).
+            tolerance_frames: Max allowed frame offset for video decode. When set,
+                tolerance_s is computed as (tolerance_frames + 0.5) / average_fps per-video.
             revision: Dataset version.
             force_cache_sync: Force sync from HuggingFace Hub.
             decode_device: Video decode device, "cpu" or "cuda".
@@ -446,6 +449,7 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
         self.image_transforms = image_transforms
         self.episodes = episodes
         self.tolerance_s = tolerance_s
+        self.tolerance_frames = tolerance_frames
         self.revision = revision if revision else CODEBASE_VERSION
         self.decode_device = decode_device
         self.temp_process = temp_process
@@ -862,7 +866,9 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
                 frames = self._decode_video_cuda(video_path, query_ts)
             else:
                 frames = decode_video_frames_torchcodec(
-                    video_path, query_ts, self.tolerance_s, decoder_cache=self.video_decoder_cache
+                    video_path, query_ts, self.tolerance_s,
+                    tolerance_frames=self.tolerance_frames,
+                    decoder_cache=self.video_decoder_cache,
                 )
 
             item[video_key] = frames.squeeze(0) if len(query_ts) == 1 else frames
@@ -885,6 +891,12 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             metadata = decoder.metadata
             average_fps = metadata.average_fps
             num_frames = metadata.num_frames
+
+            # Compute tolerance_s from tolerance_frames if provided
+            effective_tol_s = self.tolerance_s
+            if self.tolerance_frames is not None:
+                effective_tol_s = (self.tolerance_frames + 0.5) / average_fps
+
             frame_indices = [round(ts * average_fps) for ts in timestamps]
             clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
             frame_indices = [max(0, min(idx, num_frames - 1)) for idx in frame_indices]
@@ -899,9 +911,9 @@ class LoLAPretrainDataset(torch.utils.data.Dataset):
             dist = torch.cdist(query_ts_tensor[:, None], loaded_ts_tensor[:, None], p=1)
             min_, argmin_ = dist.min(1)
             clamped_mask_tensor = torch.tensor(clamped_mask)
-            is_within_tol = (min_ < self.tolerance_s) | clamped_mask_tensor
+            is_within_tol = (min_ < effective_tol_s) | clamped_mask_tensor
             assert is_within_tol.all(), (
-                f"Timestamp tolerance violated: {min_[~is_within_tol]} > {self.tolerance_s=}. "
+                f"Timestamp tolerance violated: {min_[~is_within_tol]} > {effective_tol_s=}. "
                 f"video: {video_path}"
             )
 
