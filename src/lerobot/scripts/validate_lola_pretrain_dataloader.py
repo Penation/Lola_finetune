@@ -1021,14 +1021,15 @@ def step5_video_decode(dataset, args, result):
                     else:
                         result.ok(f"camera '{cam_key}' mode={val.mode}")
 
-                    # Resolution check
+                    # Resolution check (metadata shape is HWC: [H, W, C])
                     expected_shape = dataset.meta.info["features"][cam_key]["shape"]
                     if len(expected_shape) == 3:
-                        expected_w, expected_h = expected_shape[2], expected_shape[1]
+                        expected_h, expected_w = expected_shape[0], expected_shape[1]
                         actual_w, actual_h = val.size
                         if (actual_w, actual_h) != (expected_w, expected_h):
-                            result.warn(f"camera '{cam_key}' resolution ({actual_w},{actual_h}) "
-                                        f"!= expected ({expected_w},{expected_h}) -- dynamic resolution?")
+                            video_path = f"{dataset.root}/{dataset.meta.get_video_file_path(ep_idx, cam_key)}"
+                            result.warn(f"camera '{cam_key}' resolution ({actual_w},{actual_h}) != expected ({expected_w},{expected_h}) "
+                                        f"-- video: {video_path}")
                         else:
                             result.ok(f"camera '{cam_key}' resolution matches ({expected_w},{expected_h})")
 
@@ -1093,7 +1094,7 @@ def step5_video_decode(dataset, args, result):
 
     # (c) Cross-episode resolution check
     print("  (c) Checking cross-episode resolution consistency...")
-    resolutions = {}
+    resolutions = {}  # cam_key -> {(w, h): [video_paths]}
     sample_ep_indices = list(range(0, num_episodes, max(1, num_episodes // 5)))[:5]
     for ep_idx in sample_ep_indices:
         ep_start = int(dataset._episode_starts[ep_idx])
@@ -1105,13 +1106,17 @@ def step5_video_decode(dataset, args, result):
         for cam_key in camera_keys:
             val = item.get(cam_key)
             if isinstance(val, Image.Image):
-                resolutions.setdefault(cam_key, set()).add(val.size)
+                video_path = f"{dataset.root}/{dataset.meta.get_video_file_path(ep_idx, cam_key)}"
+                resolutions.setdefault(cam_key, {}).setdefault(val.size, []).append(video_path)
 
-    for cam_key, res_set in resolutions.items():
-        if len(res_set) > 1:
-            result.warn(f"camera '{cam_key}' has varying resolutions: {res_set} (dynamic resolution expected for some AV1 datasets)")
+    for cam_key, res_dict in resolutions.items():
+        if len(res_dict) > 1:
+            res_detail = "; ".join(
+                f"{wh}: {paths}" for wh, paths in res_dict.items()
+            )
+            result.warn(f"camera '{cam_key}' has varying resolutions: {res_detail}")
         else:
-            result.ok(f"camera '{cam_key}' consistent resolution: {res_set}")
+            result.ok(f"camera '{cam_key}' consistent resolution: {set(res_dict.keys())}")
 
     # (d) Save sample images to disk
     if args.save_images_dir:

@@ -318,7 +318,10 @@ def run_azcopy_transfer(azcopy_bin, source_url, destination_path, max_retries=MA
 # 模块 4：The "Tweezers" (Targeted FUSE Fallback)
 # ==========================================
 def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
-    """扫描本地目标目录。如果发现文件缺失或大小与 FUSE 挂载点不一致，则使用标准的 Python I/O 安全复制。"""
+    """
+    扫描本地目标目录。如果发现文件缺失或大小与 FUSE 挂载点不一致，则使用标准的 Python I/O 安全复制。
+    自动跳过所有以 '.' 开头的隐藏文件和隐藏文件夹。
+    """
     fuse_path = Path(fuse_src_dir).resolve()
     dst_path = Path(local_dst_dir).resolve()
     
@@ -326,10 +329,17 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
         print(f"⚠️ 找不到 FUSE 挂载路径: {fuse_src_dir}。无法执行后备修复。")
         return
 
-    print(f"\n🔍 启动 FUSE 后备扫描: 正在对比本地 NVMe 与 {fuse_path.name}...")
+    print(f"\n🔍 启动 FUSE 后备扫描: 正在对比本地 NVMe 与 {fuse_path.name} (已开启隐藏文件过滤)...")
     fixed_count = 0
+    skipped_hidden = 0
 
-    for root, _, files in os.walk(str(fuse_path)):
+    for root, dirs, files in os.walk(str(fuse_path)):
+        # 🌟 核心过滤逻辑 1：过滤隐藏文件夹
+        # 在原地修改 dirs 列表，这样 os.walk 就不会继续往下遍历这些隐藏文件夹了，极大提升性能
+        original_dir_count = len(dirs)
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        skipped_hidden += (original_dir_count - len(dirs))
+
         current_fuse_dir = Path(root)
         rel_dir = current_fuse_dir.relative_to(fuse_path)
         current_dst_dir = dst_path / rel_dir
@@ -337,10 +347,15 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
         current_dst_dir.mkdir(parents=True, exist_ok=True)
         
         for file in files:
+            # 🌟 核心过滤逻辑 2：过滤隐藏文件
+            if file.startswith('.'):
+                skipped_hidden += 1
+                continue
+
             fuse_file = current_fuse_dir / file
             dst_file = current_dst_dir / file
             
-            # 判断是否需要修复：文件不存在，或者文件大小不一致 (说明 AzCopy 只下了一半)
+            # 判断是否需要修复：文件不存在，或者文件大小不一致
             needs_copy = False
             if not dst_file.exists():
                 needs_copy = True
@@ -359,10 +374,10 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
                     print(f"  ❌ FUSE 复制失败 {file}: {e}")
 
     if fixed_count > 0:
-        print(f"✅ 后备修复完成！成功找回并完美修复了 {fixed_count} 个顽固文件。")
+        print(f"✅ 后备修复完成！成功找回并完美修复了 {fixed_count} 个顽固文件。(同时过滤了 {skipped_hidden} 个隐藏项)")
     else:
-        print("✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！")
-
+        print(f"✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！(过滤了 {skipped_hidden} 个隐藏项)")
+        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用 AzCopy 从 Azure Blob Storage 拉取数据集")
     parser.add_argument("--account", type=str, required=True, help="Azure Storage 账户名称")
