@@ -641,6 +641,7 @@ class LoLATrainer:
             sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
             mixed_precision=mixed_precision,
             auto_wrap_policy=auto_wrap_policy,
+            use_orig_params=True,
             device_id=self.local_rank,
         )
 
