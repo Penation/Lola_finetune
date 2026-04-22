@@ -377,7 +377,7 @@ def fallback_fuse_copy(fuse_src_dir, local_dst_dir):
         print(f"✅ 后备修复完成！成功找回并完美修复了 {fixed_count} 个顽固文件。(同时过滤了 {skipped_hidden} 个隐藏项)")
     else:
         print(f"✅ 后备扫描完成：未发现缺失文件。AzCopy 已完美拉取所有数据！(过滤了 {skipped_hidden} 个隐藏项)")
-        
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="使用 AzCopy 从 Azure Blob Storage 拉取数据集")
     parser.add_argument("--account", type=str, required=True, help="Azure Storage 账户名称")
@@ -394,9 +394,9 @@ if __name__ == "__main__":
 
     tasks = [
         {
-            "cloud_path": "robot_dataset/lerobot-format-v30/merged_0412_v1/",
-            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0412_v1/",
-            "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0412_v1/",
+            "cloud_path": "robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
+            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
+            "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
         },
     ]
 
