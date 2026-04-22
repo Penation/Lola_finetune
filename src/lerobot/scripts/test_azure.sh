@@ -52,6 +52,7 @@ TRAIN_VLM=false
 LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
+CONVERT_CALVIN_RPY_TO_ORTHO6D=false
 
 # Wandb 参数
 WANDB_PROJECT="lola-azure"
@@ -160,6 +161,10 @@ while [[ $# -gt 0 ]]; do
             HISTORY_PADDING_SIDE="$2"
             shift 2
             ;;
+        --convert_calvin_rpy_to_ortho6d)
+            CONVERT_CALVIN_RPY_TO_ORTHO6D=true
+            shift
+            ;;
 
         # Wandb 参数
         --wandb_project)
@@ -265,6 +270,10 @@ fi
 # 历史action参数
 if [ "$LOAD_FULL_HISTORY" = true ]; then
     cmd="${cmd} --load_full_history --max_history_length ${MAX_HISTORY_LENGTH} --history_padding_side ${HISTORY_PADDING_SIDE}"
+fi
+
+if [ "$CONVERT_CALVIN_RPY_TO_ORTHO6D" = true ]; then
+    cmd="${cmd} --convert_calvin_rpy_to_ortho6d"
 fi
 
 # 训练 VLM 参数

@@ -383,22 +383,36 @@ if __name__ == "__main__":
     parser.add_argument("--account", type=str, required=True, help="Azure Storage 账户名称")
     parser.add_argument("--container", type=str, required=True, help="Azure Storage 容器名称")
     parser.add_argument("--max-retries", type=int, default=MAX_RETRIES, help=f"最大重试次数 (默认: {MAX_RETRIES})")
+    parser.add_argument("--cloud-path", type=str, default=None, help="Blob 容器内的目录路径")
+    parser.add_argument("--local-path", type=str, default=None, help="本地目标目录")
+    parser.add_argument("--fuse-path", type=str, default=None, help="可选的 Blobfuse 挂载目录，用于后备校验")
+    parser.add_argument("--skip-gpu-load", action="store_true", help="跳过下载阶段的 GPU 保活负载")
     args = parser.parse_args()
 
     # 启动 GPU 负载
-    start_gpu_load()
+    if not args.skip_gpu_load:
+        start_gpu_load()
 
     azcopy_bin = install_azcopy()
 
     base_url = f"https://{args.account}.blob.core.windows.net/{args.container}"
 
-    tasks = [
-        {
-            "cloud_path": "robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-            "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-            "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
-        },
-    ]
+    if args.cloud_path and args.local_path:
+        tasks = [
+            {
+                "cloud_path": args.cloud_path,
+                "local_path": args.local_path,
+                "fuse_path": args.fuse_path,
+            },
+        ]
+    else:
+        tasks = [
+            {
+                "cloud_path": "robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
+                "local_path": "/scratch/amlt_code/lola_lerobot/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
+                "fuse_path": "/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/merged_0419_mini_v2/",
+            },
+        ]
 
     # 登录 Azure Managed Identity
     subprocess.run([azcopy_bin, "login", "--identity"], check=True)
@@ -409,7 +423,8 @@ if __name__ == "__main__":
     for task in tasks:
         src_url = f"{base_url}/{task['cloud_path']}"
         success = run_azcopy_transfer(azcopy_bin, src_url, task["local_path"], max_retries=args.max_retries)
-        fallback_fuse_copy(task["fuse_path"], task["local_path"])
+        if task.get("fuse_path"):
+            fallback_fuse_copy(task["fuse_path"], task["local_path"])
         if not success:
             failed_tasks.append(task)
 

@@ -68,7 +68,7 @@ os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
 # 添加项目路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.lola_dataset import LoLADataset
 from lerobot.datasets.utils import dataset_to_policy_features
@@ -82,6 +82,187 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+CALVIN_SINGLE_ARM_RAW_DIM = 7
+CALVIN_SINGLE_ARM_ORTHO6D_DIM = 10
+
+
+def _get_motor_names(feature_spec: dict | None) -> list[str]:
+    if not feature_spec:
+        return []
+
+    names = feature_spec.get("names")
+    if isinstance(names, dict):
+        motors = names.get("motors")
+        if isinstance(motors, list):
+            return [str(name) for name in motors]
+    if isinstance(names, list):
+        return [str(name) for name in names]
+    return []
+
+
+def is_calvin_single_arm_rpy_dataset(dataset_metadata: LeRobotDatasetMetadata) -> bool:
+    """Detect the CALVIN single-arm LeRobot layout: xyz + rpy + gripper."""
+    action_spec = dataset_metadata.features.get("action", {})
+    state_spec = dataset_metadata.features.get("observation.state", {})
+
+    action_shape = tuple(action_spec.get("shape", []))
+    state_shape = tuple(state_spec.get("shape", []))
+    expected_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
+
+    return (
+        action_shape == (CALVIN_SINGLE_ARM_RAW_DIM,)
+        and state_shape == (CALVIN_SINGLE_ARM_RAW_DIM,)
+        and _get_motor_names(action_spec) == expected_names
+        and _get_motor_names(state_spec) == expected_names
+    )
+
+
+def _rpy_xyz_to_rotation_matrix(rpy: torch.Tensor) -> torch.Tensor:
+    """Convert roll/pitch/yaw (xyz convention) to rotation matrices."""
+    roll = rpy[..., 0]
+    pitch = rpy[..., 1]
+    yaw = rpy[..., 2]
+
+    cr, sr = torch.cos(roll), torch.sin(roll)
+    cp, sp = torch.cos(pitch), torch.sin(pitch)
+    cy, sy = torch.cos(yaw), torch.sin(yaw)
+
+    one = torch.ones_like(roll)
+    zero = torch.zeros_like(roll)
+
+    rx = torch.stack(
+        [
+            torch.stack([one, zero, zero], dim=-1),
+            torch.stack([zero, cr, -sr], dim=-1),
+            torch.stack([zero, sr, cr], dim=-1),
+        ],
+        dim=-2,
+    )
+    ry = torch.stack(
+        [
+            torch.stack([cp, zero, sp], dim=-1),
+            torch.stack([zero, one, zero], dim=-1),
+            torch.stack([-sp, zero, cp], dim=-1),
+        ],
+        dim=-2,
+    )
+    rz = torch.stack(
+        [
+            torch.stack([cy, -sy, zero], dim=-1),
+            torch.stack([sy, cy, zero], dim=-1),
+            torch.stack([zero, zero, one], dim=-1),
+        ],
+        dim=-2,
+    )
+
+    return rz @ ry @ rx
+
+
+def _rotation_matrix_to_ortho6d(rotation_matrix: torch.Tensor) -> torch.Tensor:
+    """Use the first two rotation-matrix columns as ortho6d."""
+    return rotation_matrix[..., :, :2].reshape(*rotation_matrix.shape[:-2], 6)
+
+
+def convert_calvin_single_arm_rpy_to_ortho6d(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert [..., 7] CALVIN state/action tensor to [..., 10] ortho6d layout."""
+    if tensor.shape[-1] != CALVIN_SINGLE_ARM_RAW_DIM:
+        raise ValueError(
+            f"Expected CALVIN single-arm tensor with last dim {CALVIN_SINGLE_ARM_RAW_DIM}, got {tensor.shape[-1]}"
+        )
+
+    xyz = tensor[..., :3]
+    rpy = tensor[..., 3:6]
+    gripper = tensor[..., 6:7]
+    rot6d = _rotation_matrix_to_ortho6d(_rpy_xyz_to_rotation_matrix(rpy))
+    return torch.cat([xyz, rot6d, gripper], dim=-1)
+
+
+def build_calvin_ortho6d_features(
+    features: dict[str, PolicyFeature],
+) -> tuple[dict[str, PolicyFeature], int]:
+    adapted = dict(features)
+    adapted["observation.state"] = PolicyFeature(
+        type=FeatureType.STATE,
+        shape=(CALVIN_SINGLE_ARM_ORTHO6D_DIM,),
+    )
+    adapted["action"] = PolicyFeature(
+        type=FeatureType.ACTION,
+        shape=(CALVIN_SINGLE_ARM_ORTHO6D_DIM,),
+    )
+    return adapted, CALVIN_SINGLE_ARM_ORTHO6D_DIM
+
+
+def _to_tensor_stat(value: Any) -> torch.Tensor:
+    return value.clone() if isinstance(value, torch.Tensor) else torch.as_tensor(value, dtype=torch.float32)
+
+
+def build_calvin_partial_normalization_stats(dataset_stats: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """
+    Build 10D stats for CALVIN single-arm ortho6d mode.
+
+    - xyz (0:3): keep dataset mean/std normalization
+    - ortho6d (3:9): identity normalization (mean=0, std=1)
+    - gripper (9): identity normalization (mean=0, std=1)
+    """
+    adapted = {key: (value.copy() if isinstance(value, dict) else value) for key, value in dataset_stats.items()}
+
+    for feature_key in ("observation.state", "action"):
+        if feature_key not in dataset_stats:
+            continue
+
+        original = dataset_stats[feature_key]
+        mean = _to_tensor_stat(original["mean"])
+        std = _to_tensor_stat(original["std"])
+
+        if mean.shape[-1] != CALVIN_SINGLE_ARM_RAW_DIM or std.shape[-1] != CALVIN_SINGLE_ARM_RAW_DIM:
+            raise ValueError(
+                f"Expected CALVIN {feature_key} stats with dim {CALVIN_SINGLE_ARM_RAW_DIM}, "
+                f"got mean={tuple(mean.shape)} std={tuple(std.shape)}"
+            )
+
+        ortho6d_mean = torch.zeros(6, dtype=mean.dtype)
+        ortho6d_std = torch.ones(6, dtype=std.dtype)
+        gripper_mean = torch.zeros(1, dtype=mean.dtype)
+        gripper_std = torch.ones(1, dtype=std.dtype)
+
+        adapted[feature_key] = dict(original)
+        adapted[feature_key]["mean"] = torch.cat([mean[:3], ortho6d_mean, gripper_mean], dim=0)
+        adapted[feature_key]["std"] = torch.cat([std[:3], ortho6d_std, gripper_std], dim=0)
+
+    return adapted
+
+
+class CalvinSingleArmBatchTransform:
+    """Convert CALVIN single-arm xyz+rpy+gripper batches to xyz+ortho6d+gripper."""
+
+    def __init__(self, action_stats: dict[str, Any]):
+        self.xyz_mean = _to_tensor_stat(action_stats["mean"])[:3]
+        self.xyz_std = _to_tensor_stat(action_stats["std"])[:3]
+
+    def _normalize_xyz_only(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.clone()
+        mean = self.xyz_mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.xyz_std.to(device=tensor.device, dtype=tensor.dtype)
+        tensor[..., :3] = (tensor[..., :3] - mean) / (std + 1e-8)
+        return tensor
+
+    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if "observation.state" in batch and isinstance(batch["observation.state"], torch.Tensor):
+            batch["observation.state"] = convert_calvin_single_arm_rpy_to_ortho6d(batch["observation.state"])
+
+        if "action" in batch and isinstance(batch["action"], torch.Tensor):
+            batch["action"] = self._normalize_xyz_only(
+                convert_calvin_single_arm_rpy_to_ortho6d(batch["action"])
+            )
+
+        if "hist_actions_full" in batch and isinstance(batch["hist_actions_full"], torch.Tensor):
+            batch["hist_actions_full"] = self._normalize_xyz_only(
+                convert_calvin_single_arm_rpy_to_ortho6d(batch["hist_actions_full"])
+            )
+
+        return batch
 
 
 def setup_distributed():
@@ -250,6 +431,7 @@ class LoLATrainer:
         wandb_name: str | None = None,
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
+        batch_transform=None,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -271,6 +453,7 @@ class LoLATrainer:
         self.wandb_entity = wandb_entity
         self.wandb_id = wandb_id
         self.use_wandb = HAS_WANDB and dist_info["world_rank"] == 0
+        self.batch_transform = batch_transform
 
         self.device = dist_info["device"]
         self.local_rank = dist_info["local_rank"]
@@ -411,6 +594,9 @@ class LoLATrainer:
         """单步训练"""
         # 移动数据到设备
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        if self.batch_transform is not None:
+            batch = self.batch_transform(batch)
 
         # 提取特殊字段
         special_data = self._extract_special_fields(batch)
@@ -694,6 +880,12 @@ def main():
     parser.add_argument("--load_full_history", action="store_true")
     parser.add_argument("--max_history_length", type=int, default=100)
     parser.add_argument("--history_padding_side", type=str, default="left", choices=["left", "right"])
+    parser.add_argument(
+        "--convert_calvin_rpy_to_ortho6d",
+        action="store_true",
+        help="Convert CALVIN single-arm xyz+rpy+gripper (7D) to xyz+ortho6d+gripper (10D). "
+        "Only xyz will be normalized; ortho6d and gripper stay in raw scale.",
+    )
 
     # Wandb 参数
     parser.add_argument("--wandb_project", type=str, default="lola-azure", help="Wandb project name")
@@ -734,7 +926,21 @@ def main():
     )
 
     features = dataset_to_policy_features(dataset_metadata.features)
-    if "action" in features:
+    dataset_stats = dataset_metadata.stats
+    batch_transform = None
+
+    if args.convert_calvin_rpy_to_ortho6d:
+        if not is_calvin_single_arm_rpy_dataset(dataset_metadata):
+            raise ValueError(
+                "The dataset does not match CALVIN single-arm xyz+rpy+gripper layout, "
+                "but --convert_calvin_rpy_to_ortho6d was requested."
+            )
+
+        logger.info("Detected CALVIN single-arm RPY dataset. Enabling 7D -> 10D ortho6d conversion.")
+        features, action_dim = build_calvin_ortho6d_features(features)
+        dataset_stats = build_calvin_partial_normalization_stats(dataset_stats)
+        batch_transform = CalvinSingleArmBatchTransform(dataset_stats["action"])
+    elif "action" in features:
         action_dim = features["action"].shape[0]
     else:
         action_dim = args.action_dim
@@ -797,7 +1003,7 @@ def main():
     # 创建训练器
     trainer = LoLATrainer(
         config=config,
-        dataset_stats=dataset_metadata.stats,
+        dataset_stats=dataset_stats,
         dist_info=dist_info,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
@@ -812,6 +1018,7 @@ def main():
         wandb_name=args.wandb_name,
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
+        batch_transform=batch_transform,
     )
 
     # 禁用 wandb
