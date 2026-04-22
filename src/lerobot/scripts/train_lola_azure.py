@@ -119,6 +119,20 @@ def is_calvin_single_arm_rpy_dataset(dataset_metadata: LeRobotDatasetMetadata) -
     )
 
 
+def is_calvin_ortho6d_dataset(dataset_metadata: LeRobotDatasetMetadata) -> bool:
+    """Detect CALVIN-style ortho6d layouts with 10 dims per arm."""
+    action_spec = dataset_metadata.features.get("action", {})
+    state_spec = dataset_metadata.features.get("observation.state", {})
+
+    action_shape = tuple(action_spec.get("shape", []))
+    state_shape = tuple(state_spec.get("shape", []))
+    if len(action_shape) != 1 or action_shape != state_shape:
+        return False
+
+    action_dim = action_shape[0]
+    return action_dim >= CALVIN_SINGLE_ARM_ORTHO6D_DIM and action_dim % CALVIN_SINGLE_ARM_ORTHO6D_DIM == 0
+
+
 def _rpy_xyz_to_rotation_matrix(rpy: torch.Tensor) -> torch.Tensor:
     """Convert roll/pitch/yaw (xyz convention) to rotation matrices."""
     roll = rpy[..., 0]
@@ -234,6 +248,54 @@ def build_calvin_partial_normalization_stats(dataset_stats: dict[str, dict[str, 
     return adapted
 
 
+def build_translation_only_norm_mask(action_dim: int) -> torch.Tensor:
+    if action_dim < CALVIN_SINGLE_ARM_ORTHO6D_DIM or action_dim % CALVIN_SINGLE_ARM_ORTHO6D_DIM != 0:
+        raise ValueError(
+            f"Expected action_dim to be a multiple of {CALVIN_SINGLE_ARM_ORTHO6D_DIM} for translation-only "
+            f"normalization, got {action_dim}"
+        )
+
+    mask = torch.zeros(action_dim, dtype=torch.bool)
+    for offset in range(0, action_dim, CALVIN_SINGLE_ARM_ORTHO6D_DIM):
+        mask[offset : offset + 3] = True
+    return mask
+
+
+def build_translation_only_normalization_stats(
+    dataset_stats: dict[str, dict[str, Any]],
+    action_dim: int,
+) -> dict[str, dict[str, Any]]:
+    """
+    Keep mean/std normalization only on translation dimensions for ortho6d action/state layouts.
+    """
+    adapted = {key: (value.copy() if isinstance(value, dict) else value) for key, value in dataset_stats.items()}
+    translation_mask = build_translation_only_norm_mask(action_dim)
+
+    for feature_key in ("observation.state", "action"):
+        if feature_key not in dataset_stats:
+            continue
+
+        original = dataset_stats[feature_key]
+        mean = _to_tensor_stat(original["mean"])
+        std = _to_tensor_stat(original["std"])
+
+        if mean.shape[-1] != action_dim or std.shape[-1] != action_dim:
+            raise ValueError(
+                f"Expected {feature_key} stats with dim {action_dim}, got mean={tuple(mean.shape)} std={tuple(std.shape)}"
+            )
+
+        adapted_mean = torch.zeros_like(mean)
+        adapted_std = torch.ones_like(std)
+        adapted_mean[translation_mask] = mean[translation_mask]
+        adapted_std[translation_mask] = std[translation_mask]
+
+        adapted[feature_key] = dict(original)
+        adapted[feature_key]["mean"] = adapted_mean
+        adapted[feature_key]["std"] = adapted_std
+
+    return adapted
+
+
 class CalvinSingleArmBatchTransform:
     """Convert CALVIN single-arm xyz+rpy+gripper batches to xyz+ortho6d+gripper."""
 
@@ -261,6 +323,36 @@ class CalvinSingleArmBatchTransform:
             batch["hist_actions_full"] = self._normalize_xyz_only(
                 convert_calvin_single_arm_rpy_to_ortho6d(batch["hist_actions_full"])
             )
+
+        return batch
+
+
+class TranslationOnlyActionBatchTransform:
+    """Normalize only translation dims for pre-extracted action history tensors."""
+
+    def __init__(self, action_stats: dict[str, Any]):
+        mean = _to_tensor_stat(action_stats["mean"])
+        std = _to_tensor_stat(action_stats["std"])
+        self.translation_mask = build_translation_only_norm_mask(mean.shape[-1])
+        self.mean = mean
+        self.std = std
+
+    def _normalize_translation_only(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.clone()
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+        mask = self.translation_mask.to(device=tensor.device)
+
+        normalized = (tensor - mean) / (std + 1e-8)
+        tensor[..., mask] = normalized[..., mask]
+        return tensor
+
+    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
+        if "action" in batch and isinstance(batch["action"], torch.Tensor):
+            batch["action"] = self._normalize_translation_only(batch["action"])
+
+        if "hist_actions_full" in batch and isinstance(batch["hist_actions_full"], torch.Tensor):
+            batch["hist_actions_full"] = self._normalize_translation_only(batch["hist_actions_full"])
 
         return batch
 
@@ -886,6 +978,12 @@ def main():
         help="Convert CALVIN single-arm xyz+rpy+gripper (7D) to xyz+ortho6d+gripper (10D). "
         "Only xyz will be normalized; ortho6d and gripper stay in raw scale.",
     )
+    parser.add_argument(
+        "--calvin_xyz_only_normalize",
+        action="store_true",
+        help="For CALVIN ortho6d datasets, normalize only translation dims (xyz). "
+        "If the dataset is legacy 7D xyz+rpy+gripper, it will be converted to 10D ortho6d first.",
+    )
 
     # Wandb 参数
     parser.add_argument("--wandb_project", type=str, default="lola-azure", help="Wandb project name")
@@ -920,6 +1018,13 @@ def main():
 
     # 获取数据集元数据
     logger.info(f"Loading dataset metadata...")
+    if args.dataset_root is not None:
+        info_path = os.path.join(args.dataset_root, "meta", "info.json")
+        if not os.path.isfile(info_path):
+            raise FileNotFoundError(
+                f"Dataset root is missing metadata file: {info_path}. "
+                "Please pass the actual LeRobot dataset root directory."
+            )
     dataset_metadata = LeRobotDatasetMetadata(
         args.dataset_repo_id,
         root=args.dataset_root,
@@ -929,17 +1034,27 @@ def main():
     dataset_stats = dataset_metadata.stats
     batch_transform = None
 
-    if args.convert_calvin_rpy_to_ortho6d:
-        if not is_calvin_single_arm_rpy_dataset(dataset_metadata):
-            raise ValueError(
-                "The dataset does not match CALVIN single-arm xyz+rpy+gripper layout, "
-                "but --convert_calvin_rpy_to_ortho6d was requested."
-            )
+    calvin_translation_only_mode = args.convert_calvin_rpy_to_ortho6d or args.calvin_xyz_only_normalize
 
-        logger.info("Detected CALVIN single-arm RPY dataset. Enabling 7D -> 10D ortho6d conversion.")
-        features, action_dim = build_calvin_ortho6d_features(features)
-        dataset_stats = build_calvin_partial_normalization_stats(dataset_stats)
-        batch_transform = CalvinSingleArmBatchTransform(dataset_stats["action"])
+    if calvin_translation_only_mode:
+        if is_calvin_single_arm_rpy_dataset(dataset_metadata):
+            logger.info("Detected CALVIN single-arm RPY dataset. Enabling 7D -> 10D ortho6d conversion.")
+            features, action_dim = build_calvin_ortho6d_features(features)
+            dataset_stats = build_calvin_partial_normalization_stats(dataset_stats)
+            batch_transform = CalvinSingleArmBatchTransform(dataset_stats["action"])
+        elif is_calvin_ortho6d_dataset(dataset_metadata):
+            action_dim = features["action"].shape[0]
+            logger.info(
+                f"Detected CALVIN ortho6d dataset with action_dim={action_dim}. "
+                "Enabling translation-only normalization."
+            )
+            dataset_stats = build_translation_only_normalization_stats(dataset_stats, action_dim)
+            batch_transform = TranslationOnlyActionBatchTransform(dataset_stats["action"])
+        else:
+            raise ValueError(
+                "CALVIN translation-only normalization was requested, but the dataset layout is neither "
+                "legacy 7D xyz+rpy+gripper nor an ortho6d layout with 10 dims per arm."
+            )
     elif "action" in features:
         action_dim = features["action"].shape[0]
     else:

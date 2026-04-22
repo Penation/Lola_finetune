@@ -53,6 +53,7 @@ LOAD_FULL_HISTORY=true
 MAX_HISTORY_LENGTH=1024
 HISTORY_PADDING_SIDE="left"
 CONVERT_CALVIN_RPY_TO_ORTHO6D=false
+CALVIN_XYZ_ONLY_NORMALIZE=false
 
 # Wandb 参数
 WANDB_PROJECT="lola-azure"
@@ -165,6 +166,10 @@ while [[ $# -gt 0 ]]; do
             CONVERT_CALVIN_RPY_TO_ORTHO6D=true
             shift
             ;;
+        --calvin_xyz_only_normalize)
+            CALVIN_XYZ_ONLY_NORMALIZE=true
+            shift
+            ;;
 
         # Wandb 参数
         --wandb_project)
@@ -274,6 +279,10 @@ fi
 
 if [ "$CONVERT_CALVIN_RPY_TO_ORTHO6D" = true ]; then
     cmd="${cmd} --convert_calvin_rpy_to_ortho6d"
+fi
+
+if [ "$CALVIN_XYZ_ONLY_NORMALIZE" = true ]; then
+    cmd="${cmd} --calvin_xyz_only_normalize"
 fi
 
 # 训练 VLM 参数
