@@ -34,6 +34,7 @@ MASTER_PORT=29500
 STRATEGY="fsdp"
 BATCH_SIZE=4
 MAX_STEPS=10000
+MAX_EPOCHS=""
 LEARNING_RATE=2.5e-5
 LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
@@ -47,6 +48,8 @@ DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
 CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
 TRAIN_VLM=false
+STAGE_TRAIN_VLM_AFTER_EPOCH=0
+SAVE_CHECKPOINT_ON_VLM_UNFREEZE=false
 
 # 历史action加载参数
 LOAD_FULL_HISTORY=true
@@ -104,6 +107,10 @@ while [[ $# -gt 0 ]]; do
             MAX_STEPS="$2"
             shift 2
             ;;
+        --max_epochs)
+            MAX_EPOCHS="$2"
+            shift 2
+            ;;
         --learning_rate)
             LEARNING_RATE="$2"
             shift 2
@@ -142,6 +149,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --train_vlm)
             TRAIN_VLM=true
+            shift
+            ;;
+        --stage_train_vlm_after_epoch)
+            STAGE_TRAIN_VLM_AFTER_EPOCH="$2"
+            shift 2
+            ;;
+        --save_checkpoint_on_vlm_unfreeze)
+            SAVE_CHECKPOINT_ON_VLM_UNFREEZE=true
             shift
             ;;
 
@@ -219,10 +234,12 @@ echo "Training Config:"
 echo "  - Strategy: ${STRATEGY}"
 echo "  - Batch size: ${BATCH_SIZE}"
 echo "  - Max steps: ${MAX_STEPS}"
+echo "  - Max epochs: ${MAX_EPOCHS}"
 echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - VLM path: ${VLM_PATH}"
+echo "  - Stage train VLM after epoch: ${STAGE_TRAIN_VLM_AFTER_EPOCH}"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -285,9 +302,21 @@ if [ "$CALVIN_XYZ_ONLY_NORMALIZE" = true ]; then
     cmd="${cmd} --calvin_xyz_only_normalize"
 fi
 
+if [ -n "$MAX_EPOCHS" ]; then
+    cmd="${cmd} --max_epochs ${MAX_EPOCHS}"
+fi
+
 # 训练 VLM 参数
 if [ "$TRAIN_VLM" = true ]; then
     cmd="${cmd} --train_vlm"
+fi
+
+if [ "$STAGE_TRAIN_VLM_AFTER_EPOCH" -gt 0 ]; then
+    cmd="${cmd} --stage_train_vlm_after_epoch ${STAGE_TRAIN_VLM_AFTER_EPOCH}"
+fi
+
+if [ "$SAVE_CHECKPOINT_ON_VLM_UNFREEZE" = true ]; then
+    cmd="${cmd} --save_checkpoint_on_vlm_unfreeze"
 fi
 
 # Wandb 参数

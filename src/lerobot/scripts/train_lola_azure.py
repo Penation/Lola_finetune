@@ -524,6 +524,8 @@ class LoLATrainer:
         wandb_entity: str | None = None,
         wandb_id: str | None = None,
         batch_transform=None,
+        stage_train_vlm_after_epoch: int = 0,
+        save_checkpoint_on_vlm_unfreeze: bool = True,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -546,6 +548,8 @@ class LoLATrainer:
         self.wandb_id = wandb_id
         self.use_wandb = HAS_WANDB and dist_info["world_rank"] == 0
         self.batch_transform = batch_transform
+        self.stage_train_vlm_after_epoch = stage_train_vlm_after_epoch
+        self.save_checkpoint_on_vlm_unfreeze = save_checkpoint_on_vlm_unfreeze
 
         self.device = dist_info["device"]
         self.local_rank = dist_info["local_rank"]
@@ -569,6 +573,35 @@ class LoLATrainer:
         # 训练状态
         self.global_step = 0
         self.best_loss = float("inf")
+        self.vlm_unfrozen = train_vlm
+
+    def _log_trainable_params(self):
+        trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.policy.parameters())
+        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+
+    def _set_vlm_trainability(self, enable: bool):
+        self.train_vlm = enable
+        self.config.train_vlm = enable
+
+        if not hasattr(self.policy, "vlm"):
+            return
+
+        for param in self.policy.vlm.parameters():
+            param.requires_grad = enable
+
+        if enable:
+            self.policy.vlm.train()
+            if self.config.gradient_checkpointing and hasattr(self.policy.vlm, "gradient_checkpointing_enable"):
+                self.policy.vlm.gradient_checkpointing_enable()
+            logger.info("VLM parameters are now trainable.")
+        else:
+            self.policy.vlm.eval()
+            if hasattr(self.policy.vlm, "gradient_checkpointing_disable"):
+                self.policy.vlm.gradient_checkpointing_disable()
+            logger.info("VLM parameters are frozen.")
+
+        self._log_trainable_params()
 
     def setup_model(self):
         """设置模型"""
@@ -579,6 +612,11 @@ class LoLATrainer:
         self.policy._device = self.device
         self.policy.model = self.policy.model.to(self.device)
         self.policy.vlm = self.policy.vlm.to(self.device)
+        logger.info(
+            "LoLA initialization: VLM weights are loaded from vlm_path/vlm_model_name, "
+            "while the LoLA VLA modules (action encoder, bridge, DiT head) start from random initialization "
+            "unless --resume loads a LoLA checkpoint."
+        )
 
         # 创建预处理器和后处理器
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -586,17 +624,7 @@ class LoLATrainer:
             dataset_stats=self.dataset_stats,
         )
 
-        # 冻结 VLM 参数
-        if not self.train_vlm and hasattr(self.policy, "vlm"):
-            logger.info("Freezing VLM parameters...")
-            for param in self.policy.vlm.parameters():
-                param.requires_grad = False
-            self.policy.vlm.eval()
-
-        # 打印参数统计
-        trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.policy.parameters())
-        logger.info(f"Trainable params: {trainable_params:,} / {total_params:,}")
+        self._set_vlm_trainability(self.train_vlm)
 
         # 设置分布式
         if self.is_distributed:
@@ -647,10 +675,8 @@ class LoLATrainer:
 
     def setup_optimizer(self):
         """设置优化器"""
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            self.model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
@@ -666,6 +692,28 @@ class LoLATrainer:
             pct_start=warmup_ratio,
             anneal_strategy="cos",
         )
+
+    def _maybe_unfreeze_vlm_for_epoch(self, epoch: int, ckpt_dir: str):
+        if self.stage_train_vlm_after_epoch <= 0 or self.vlm_unfrozen:
+            return
+
+        if epoch != self.stage_train_vlm_after_epoch + 1:
+            return
+
+        if self.save_checkpoint_on_vlm_unfreeze and self.is_main_process:
+            self.save_checkpoint(
+                ckpt_dir,
+                self.global_step,
+                tag=f"epoch_{epoch - 1:03d}_before_vlm_unfreeze_step_{self.global_step:06d}",
+            )
+            logger.info(
+                f"Saved checkpoint at end of epoch {epoch - 1} before unfreezing VLM (step {self.global_step})."
+            )
+
+        self._set_vlm_trainability(True)
+        self.model.train()
+        self.vlm_unfrozen = True
+        logger.info(f"Epoch {epoch}: VLM unfrozen. Training VLM + VLA jointly from this epoch onward.")
 
     def _extract_special_fields(self, batch):
         """提取特殊字段"""
@@ -769,10 +817,23 @@ class LoLATrainer:
             skip_batches = 0
 
         epoch = 0
+        if (
+            self.stage_train_vlm_after_epoch > 0
+            and batches_per_epoch is not None
+            and self.max_steps <= self.stage_train_vlm_after_epoch * batches_per_epoch
+        ):
+            logger.warning(
+                "The configured max_steps will finish before the scheduled VLM unfreeze epoch is reached. "
+                f"max_steps={self.max_steps}, batches_per_epoch={batches_per_epoch}, "
+                f"stage_train_vlm_after_epoch={self.stage_train_vlm_after_epoch}"
+            )
+
         while self.global_step < self.max_steps:
             epoch += 1
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
+
+            self._maybe_unfreeze_vlm_for_epoch(epoch, ckpt_dir)
 
             for batch_idx, batch in enumerate(train_loader):
                 if self.global_step >= self.max_steps:
@@ -862,7 +923,7 @@ class LoLATrainer:
         if self.use_wandb:
             wandb.finish()
 
-    def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False):
+    def save_checkpoint(self, ckpt_dir: str, step: int, is_final: bool = False, tag: str | None = None):
         """保存 checkpoint"""
         if self.strategy == "fsdp":
             from torch.distributed.checkpoint import save as save_fsdp_checkpoint
@@ -870,7 +931,10 @@ class LoLATrainer:
 
             # FSDP checkpoint 保存：用 get_state_dict 获取模型和优化器的分片 state_dict
             model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
-            ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}" if not is_final else "final")
+            if tag is not None:
+                ckpt_path = os.path.join(ckpt_dir, tag)
+            else:
+                ckpt_path = os.path.join(ckpt_dir, f"step_{step:06d}" if not is_final else "final")
             save_fsdp_checkpoint(
                 {
                     "model": model_sd,
@@ -888,7 +952,10 @@ class LoLATrainer:
         else:
             # DDP checkpoint 保存
             state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
-            ckpt_name = f"lola-step-{step:06d}.pt" if not is_final else "lola-final.pt"
+            if tag is not None:
+                ckpt_name = f"{tag}.pt"
+            else:
+                ckpt_name = f"lola-step-{step:06d}.pt" if not is_final else "lola-final.pt"
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             torch.save({
                 "step": step,
@@ -952,6 +1019,7 @@ def main():
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--max_epochs", type=int, default=None, help="If set, override max_steps using full-epoch counting")
     parser.add_argument("--learning_rate", type=float, default=2.5e-5)
     parser.add_argument("--log_every_n_steps", type=int, default=10)
     parser.add_argument("--save_every_n_steps", type=int, default=500)
@@ -960,6 +1028,17 @@ def main():
     # 模型参数
     parser.add_argument("--vlm_path", type=str, default="/data_16T/deepseek/qwen3_5/Qwen3.5-4B/")
     parser.add_argument("--train_vlm", action="store_true")
+    parser.add_argument(
+        "--stage_train_vlm_after_epoch",
+        type=int,
+        default=0,
+        help="If > 0, keep VLM frozen for the first N epochs, then unfreeze from epoch N+1 onward.",
+    )
+    parser.add_argument(
+        "--save_checkpoint_on_vlm_unfreeze",
+        action="store_true",
+        help="Save a checkpoint right before switching from frozen-VLM to joint VLM+VLA training.",
+    )
     parser.add_argument("--ckpt_dir", type=str, default="/data_16T/deepseek/checkpoints/lola")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
 
@@ -1013,8 +1092,10 @@ def main():
         logger.info(f"Batch Size: {args.batch_size}")
         logger.info(f"Learning Rate: {args.learning_rate}")
         logger.info(f"Max Steps: {args.max_steps}")
+        logger.info(f"Max Epochs: {args.max_epochs}")
         logger.info(f"VLM Path: {args.vlm_path}")
         logger.info(f"Train VLM: {args.train_vlm}")
+        logger.info(f"Stage Train VLM After Epoch: {args.stage_train_vlm_after_epoch}")
         logger.info("=" * 60)
 
     # 获取数据集元数据
@@ -1064,6 +1145,8 @@ def main():
     logger.info(f"Dataset: {dataset_metadata.total_episodes} episodes, {dataset_metadata.total_frames} frames")
     logger.info(f"Action dim: {action_dim}")
 
+    initial_train_vlm = args.train_vlm and args.stage_train_vlm_after_epoch <= 0
+
     # 创建 LoLA 配置
     config = LoLAConfig(
         vlm_model_name="Qwen/Qwen3.5-4B",
@@ -1074,7 +1157,7 @@ def main():
         n_obs_steps=args.n_obs_steps,
         input_features={key: ft for key, ft in features.items() if ft.type != FeatureType.ACTION},
         output_features={key: ft for key, ft in features.items() if ft.type == FeatureType.ACTION},
-        train_vlm=args.train_vlm,
+        train_vlm=initial_train_vlm,
         load_full_history=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
@@ -1116,14 +1199,23 @@ def main():
         drop_last=True,  # 分布式训练建议 drop_last
     )
 
+    effective_max_steps = args.max_steps
+    if args.max_epochs is not None:
+        steps_per_epoch = len(train_loader)
+        effective_max_steps = steps_per_epoch * args.max_epochs
+        logger.info(
+            f"Using epoch-based schedule: steps_per_epoch={steps_per_epoch}, "
+            f"max_epochs={args.max_epochs}, effective_max_steps={effective_max_steps}"
+        )
+
     # 创建训练器
     trainer = LoLATrainer(
         config=config,
         dataset_stats=dataset_stats,
         dist_info=dist_info,
         learning_rate=args.learning_rate,
-        max_steps=args.max_steps,
-        train_vlm=args.train_vlm,
+        max_steps=effective_max_steps,
+        train_vlm=initial_train_vlm,
         strategy=args.strategy,
         gradient_clip_val=args.gradient_clip_val,
         ckpt_dir=args.ckpt_dir,
@@ -1135,6 +1227,8 @@ def main():
         wandb_entity=args.wandb_entity,
         wandb_id=args.wandb_id,
         batch_transform=batch_transform,
+        stage_train_vlm_after_epoch=args.stage_train_vlm_after_epoch,
+        save_checkpoint_on_vlm_unfreeze=args.save_checkpoint_on_vlm_unfreeze,
     )
 
     # 禁用 wandb
