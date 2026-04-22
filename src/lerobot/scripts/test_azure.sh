@@ -43,6 +43,7 @@ GRADIENT_CLIP_VAL=1.0
 # 数据集参数
 DATASET_REPO_ID=""
 DATASET_ROOT="/mnt/wangxiaofa/robot_dataset/lerobot-format-v30/simpler_bridge_v3"
+VIDEO_BACKEND=""
 
 # 模型参数
 VLM_PATH="/mnt/wangxiaofa/qwen3_5/Qwen3.5-4B/"
@@ -135,6 +136,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dataset_root)
             DATASET_ROOT="$2"
+            shift 2
+            ;;
+        --video_backend)
+            VIDEO_BACKEND="$2"
             shift 2
             ;;
 
@@ -238,6 +243,7 @@ echo "  - Max epochs: ${MAX_EPOCHS}"
 echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
+echo "  - Video backend: ${VIDEO_BACKEND:-auto}"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - Stage train VLM after epoch: ${STAGE_TRAIN_VLM_AFTER_EPOCH}"
 echo "========================================"
@@ -287,6 +293,10 @@ if [ -n "$DATASET_REPO_ID" ]; then
     cmd="${cmd} --dataset_repo_id ${DATASET_REPO_ID}"
 else
     cmd="${cmd} --dataset_root ${DATASET_ROOT}"
+fi
+
+if [ -n "$VIDEO_BACKEND" ]; then
+    cmd="${cmd} --video_backend ${VIDEO_BACKEND}"
 fi
 
 # 历史action参数

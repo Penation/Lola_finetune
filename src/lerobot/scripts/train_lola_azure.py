@@ -1014,6 +1014,13 @@ def main():
     parser.add_argument("--dataset_repo_id", type=str, default=None)
     parser.add_argument("--dataset_root", type=str, default=None)
     parser.add_argument("--episodes", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--video_backend",
+        type=str,
+        default=None,
+        choices=["pyav", "torchvision", "torchcodec"],
+        help="Explicit video decode backend. Use pyav on AMLT when torchcodec runtime libs are unavailable.",
+    )
 
     # 训练参数
     parser.add_argument("--strategy", type=str, default="ddp", choices=["ddp", "fsdp"])
@@ -1093,6 +1100,7 @@ def main():
         logger.info(f"Learning Rate: {args.learning_rate}")
         logger.info(f"Max Steps: {args.max_steps}")
         logger.info(f"Max Epochs: {args.max_epochs}")
+        logger.info(f"Video Backend: {args.video_backend or 'auto'}")
         logger.info(f"VLM Path: {args.vlm_path}")
         logger.info(f"Train VLM: {args.train_vlm}")
         logger.info(f"Stage Train VLM After Epoch: {args.stage_train_vlm_after_epoch}")
@@ -1170,6 +1178,7 @@ def main():
         config=config,
         root=args.dataset_root,
         episodes=args.episodes,
+        video_backend=args.video_backend,
         use_lola_dataset=args.load_full_history,
         max_history_length=args.max_history_length,
         history_padding_side=args.history_padding_side,
