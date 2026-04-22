@@ -58,6 +58,7 @@ Qwen3.5 Input Format:
     ```
 """
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -293,6 +294,7 @@ class LolaQwenProcessor(ObservationProcessorStep):
     def __init__(
         self, 
         processor_name: str = "Qwen/Qwen3.5-4B",
+        processor_path: str | None = None,
         max_length: int = 512,
         task_key: str = "task",
         **kwargs
@@ -300,11 +302,13 @@ class LolaQwenProcessor(ObservationProcessorStep):
         """
         Args:
             processor_name: The HuggingFace model name for the processor.
+            processor_path: Optional local path for the processor files. Preferred in offline training.
             max_length: Maximum sequence length for tokenization.
             task_key: Key in complementary_data containing the task description.
         """
         super().__init__(**kwargs)
         self.processor_name = processor_name
+        self.processor_path = processor_path
         self.max_length = max_length
         self.task_key = task_key
         
@@ -314,7 +318,8 @@ class LolaQwenProcessor(ObservationProcessorStep):
                 "Please install it with `pip install transformers`."
             )
         
-        self.qwen_processor = AutoProcessor.from_pretrained(processor_name)
+        processor_source = processor_path if processor_path and os.path.exists(processor_path) else processor_name
+        self.qwen_processor = AutoProcessor.from_pretrained(processor_source)
     
     def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
         """
@@ -473,6 +478,7 @@ def make_lola_pre_post_processors(
     
     # Determine processor settings from config
     vlm_model_name = config.vlm_model_name
+    vlm_path = getattr(config, "vlm_path", None)
     max_length = getattr(config, 'tokenizer_max_length', 512)
     
     # Pre-processor steps
@@ -489,6 +495,7 @@ def make_lola_pre_post_processors(
         LolaImageProcessor(camera_keys=camera_keys),  # Extract and prepare images for Qwen3.5
         LolaQwenProcessor(  # Process text + images with Qwen3.5's apply_chat_template
             processor_name=vlm_model_name,
+            processor_path=vlm_path,
             max_length=max_length,
         ),
         LolaEmptyTokenProcessor(empty_token_id=config.empty_token_id),  # Append empty token for LoLA
