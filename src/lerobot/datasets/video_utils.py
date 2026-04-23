@@ -148,9 +148,13 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    # PyAV timestamp rounding can drift by a few 1e-4 seconds on CALVIN videos.
+    # Keep the tolerance strict for other backends, but avoid false positives here.
+    effective_tolerance_s = max(tolerance_s, 1e-3) if backend == "pyav" else tolerance_s
+    is_within_tol = min_ <= effective_tolerance_s
     assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+        f"One or several query timestamps unexpectedly violate the tolerance "
+        f"({min_[~is_within_tol]} > effective_tolerance_s={effective_tolerance_s})."
         "It means that the closest frame that can be loaded from the video is too far away in time."
         "This might be due to synchronization issues with timestamps during data collection."
         "To be safe, we advise to ignore this item during training."
