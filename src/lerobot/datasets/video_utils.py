@@ -148,9 +148,21 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    # PyAV timestamp rounding can drift by a few 1e-4 seconds on CALVIN videos.
-    # Keep the tolerance strict for other backends, but avoid false positives here.
-    effective_tolerance_s = max(tolerance_s, 1e-3) if backend == "pyav" else tolerance_s
+    # PyAV can expose rounded PTS values that drift from the requested timestamps.
+    # For CALVIN videos this drift is small relative to the frame interval, but large
+    # enough to trip the default 1e-4s tolerance. Make the tolerance backend-specific
+    # and derive it from the observed frame spacing so we stay within half a frame.
+    effective_tolerance_s = tolerance_s
+    if backend == "pyav" and len(loaded_ts) > 1:
+        frame_deltas = torch.diff(loaded_ts)
+        positive_frame_deltas = frame_deltas[frame_deltas > 0]
+        if len(positive_frame_deltas) > 0:
+            inferred_half_frame_s = positive_frame_deltas.min().item() / 2
+            effective_tolerance_s = max(tolerance_s, inferred_half_frame_s)
+        else:
+            effective_tolerance_s = max(tolerance_s, 1e-3)
+    elif backend == "pyav":
+        effective_tolerance_s = max(tolerance_s, 1e-3)
     is_within_tol = min_ <= effective_tolerance_s
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance "
