@@ -44,6 +44,7 @@ import argparse
 import datetime
 import logging
 import os
+import re
 import sys
 import time
 from datetime import timedelta
@@ -54,6 +55,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 try:
     import wandb
@@ -296,6 +301,15 @@ def build_translation_only_normalization_stats(
     return adapted
 
 
+def infer_step_from_checkpoint_path(ckpt_path: str) -> int:
+    """Best-effort fallback for legacy checkpoints that did not persist step reliably."""
+    for part in reversed(os.path.normpath(ckpt_path).split(os.sep)):
+        match = re.search(r"step_(\d+)", part)
+        if match:
+            return int(match.group(1))
+    return 0
+
+
 class CalvinSingleArmBatchTransform:
     """Convert CALVIN single-arm xyz+rpy+gripper batches to xyz+ortho6d+gripper."""
 
@@ -378,10 +392,12 @@ def setup_distributed():
     master_port = os.environ.get("MASTER_PORT", "29500")
     master_uri = "tcp://%s:%s" % (master_addr, master_port)
 
-    # 设置当前设备
+    # 先绑定当前进程到对应 GPU，再初始化 NCCL。
+    # 否则 NCCL 可能在首次 collective/barrier 时无法确定 rank -> device 映射。
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
 
     if world_size > 1:
-        
         # 初始化进程组
         dist.init_process_group(
             backend="nccl",
@@ -391,13 +407,13 @@ def setup_distributed():
             rank=world_rank,
         )
 
-        logger.info(f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, "
-                    f"world_size={world_size}, master={master_uri}")
+        logger.info(
+            f"Distributed initialized: rank={world_rank}, local_rank={local_rank}, "
+            f"world_size={world_size}, master={master_uri}, device={device}"
+        )
     else:
-        logger.info(f"Single GPU mode: local_rank={local_rank}")
-    
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+        logger.info(f"Single GPU mode: local_rank={local_rank}, device={device}")
+
     return {
         "world_size": world_size,
         "local_rank": local_rank,
@@ -526,6 +542,7 @@ class LoLATrainer:
         batch_transform=None,
         stage_train_vlm_after_epoch: int = 0,
         save_checkpoint_on_vlm_unfreeze: bool = True,
+        save_checkpoint_every_epoch: bool = False,
     ):
         self.config = config
         self.dataset_stats = dataset_stats
@@ -550,6 +567,7 @@ class LoLATrainer:
         self.batch_transform = batch_transform
         self.stage_train_vlm_after_epoch = stage_train_vlm_after_epoch
         self.save_checkpoint_on_vlm_unfreeze = save_checkpoint_on_vlm_unfreeze
+        self.save_checkpoint_every_epoch = save_checkpoint_every_epoch
 
         self.device = dist_info["device"]
         self.local_rank = dist_info["local_rank"]
@@ -574,6 +592,22 @@ class LoLATrainer:
         self.global_step = 0
         self.best_loss = float("inf")
         self.vlm_unfrozen = train_vlm
+
+    def _build_shared_ckpt_dir(self) -> tuple[str, str]:
+        """Create one checkpoint directory name shared by all ranks."""
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") if self.is_main_process else None
+        if self.is_distributed:
+            time_payload = [time_str]
+            dist.broadcast_object_list(time_payload, src=0)
+            time_str = time_payload[0]
+
+        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-{time_str}")
+        if self.is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            logger.info(f"Checkpoint directory: {ckpt_dir}")
+        if self.is_distributed:
+            dist.barrier(device_ids=[self.local_rank])
+        return ckpt_dir, time_str
 
     def _log_trainable_params(self):
         trainable_params = sum(p.numel() for p in self.policy.parameters() if p.requires_grad)
@@ -700,15 +734,17 @@ class LoLATrainer:
         if epoch != self.stage_train_vlm_after_epoch + 1:
             return
 
-        if self.save_checkpoint_on_vlm_unfreeze and self.is_main_process:
+        # FSDP checkpoint save uses distributed collectives, so every rank must participate.
+        if self.save_checkpoint_on_vlm_unfreeze and (self.strategy == "fsdp" or self.is_main_process):
             self.save_checkpoint(
                 ckpt_dir,
                 self.global_step,
                 tag=f"epoch_{epoch - 1:03d}_before_vlm_unfreeze_step_{self.global_step:06d}",
             )
-            logger.info(
-                f"Saved checkpoint at end of epoch {epoch - 1} before unfreezing VLM (step {self.global_step})."
-            )
+            if self.is_main_process:
+                logger.info(
+                    f"Saved checkpoint at end of epoch {epoch - 1} before unfreezing VLM (step {self.global_step})."
+                )
 
         self._set_vlm_trainability(True)
         self.model.train()
@@ -755,36 +791,55 @@ class LoLATrainer:
     def train(self, train_loader, start_step: int = 0):
         """训练循环"""
         self.global_step = start_step
+        logger.info("Entering train(): calling model.train()")
         self.model.train()
+        logger.info("model.train() completed")
 
         # 创建 checkpoint 目录
-        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        ckpt_dir = os.path.join(self.ckpt_dir, f"lola-azure-{time_str}")
-        if self.is_main_process:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            logger.info(f"Checkpoint directory: {ckpt_dir}")
+        ckpt_dir, time_str = self._build_shared_ckpt_dir()
 
         # 初始化 Wandb
         if self.use_wandb:
             wandb_run_name = self.wandb_name or f"lola-{self.strategy}-{time_str}"
-            wandb.init(
-                project=self.wandb_project,
-                name=wandb_run_name,
-                entity=self.wandb_entity,
-                id=self.wandb_id,
-                resume="allow" if self.wandb_id else None,
-                config={
-                    "learning_rate": self.learning_rate,
-                    "weight_decay": self.weight_decay,
-                    "max_steps": self.max_steps,
-                    "batch_size": train_loader.batch_size,
-                    "strategy": self.strategy,
-                    "world_size": self.world_size,
-                    "train_vlm": self.train_vlm,
-                    "gradient_clip_val": self.gradient_clip_val,
-                },
+            service_wait_s = int(os.environ.get("WANDB__SERVICE_WAIT", os.environ.get("WANDB_SERVICE_WAIT", "120")))
+            init_timeout_s = int(os.environ.get("WANDB_INIT_TIMEOUT", "120"))
+            start_method = os.environ.get("WANDB_START_METHOD", "thread")
+            logger.info(
+                f"Initializing wandb: run={wandb_run_name}, start_method={start_method}, "
+                f"service_wait={service_wait_s}s, init_timeout={init_timeout_s}s"
             )
-            logger.info(f"Wandb initialized: {wandb_run_name}")
+            try:
+                wandb.init(
+                    project=self.wandb_project,
+                    name=wandb_run_name,
+                    entity=self.wandb_entity,
+                    id=self.wandb_id,
+                    resume="allow" if self.wandb_id else None,
+                    settings=wandb.Settings(
+                        start_method=start_method,
+                        init_timeout=init_timeout_s,
+                        _service_wait=service_wait_s,
+                    ),
+                    config={
+                        "learning_rate": self.learning_rate,
+                        "weight_decay": self.weight_decay,
+                        "max_steps": self.max_steps,
+                        "batch_size": train_loader.batch_size,
+                        "strategy": self.strategy,
+                        "world_size": self.world_size,
+                        "train_vlm": self.train_vlm,
+                        "gradient_clip_val": self.gradient_clip_val,
+                    },
+                )
+                logger.info(f"Wandb initialized: {wandb_run_name}")
+            except Exception:
+                logger.exception("wandb.init failed; disabling wandb for this run.")
+                self.use_wandb = False
+
+        if self.is_distributed:
+            logger.info("Waiting at pre-training distributed barrier.")
+            dist.barrier(device_ids=[self.local_rank])
+            logger.info("Passed pre-training distributed barrier.")
 
         logger.info(f"Starting training from step {start_step} to {self.max_steps}")
 
@@ -817,6 +872,24 @@ class LoLATrainer:
             skip_batches = 0
 
         epoch = 0
+        total_update_time = 0.0
+        total_logged_updates = 0
+        progress_bar = None
+        if (
+            self.is_main_process
+            and tqdm is not None
+            and os.environ.get("DISABLE_TQDM", "0") != "1"
+        ):
+            progress_bar = tqdm(
+                total=self.max_steps,
+                initial=self.global_step,
+                desc="LoLA train",
+                file=sys.stdout,
+                dynamic_ncols=False,
+                mininterval=1.0,
+                smoothing=0.05,
+                leave=True,
+            )
         if (
             self.stage_train_vlm_after_epoch > 0
             and batches_per_epoch is not None
@@ -881,20 +954,42 @@ class LoLATrainer:
                 self.scheduler.step()
 
                 self.global_step += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
 
                 # 计算步耗时
                 update_s = round(time.monotonic() - step_start, 2)
+                total_update_time += update_s
+                total_logged_updates += 1
 
                 # 日志
                 if self.global_step % self.log_every_n_steps == 0:
                     lr = self.scheduler.get_last_lr()[0]
                     if self.is_main_process:
+                        progress_pct = 100.0 * self.global_step / max(1, self.max_steps)
+                        avg_update_s = total_update_time / max(1, total_logged_updates)
+                        remaining_steps = max(0, self.max_steps - self.global_step)
+                        eta_seconds = int(avg_update_s * remaining_steps)
+                        eta_str = str(datetime.timedelta(seconds=eta_seconds))
+                        epoch_batch_str = (
+                            f"{batch_idx + 1}/{batches_per_epoch}" if batches_per_epoch is not None else f"{batch_idx + 1}/?"
+                        )
                         logger.info(
                             f"Step {self.global_step}/{self.max_steps} | "
+                            f"{progress_pct:.2f}% | "
+                            f"Epoch {epoch} Batch {epoch_batch_str} | "
                             f"Loss: {loss.item():.4f} | "
                             f"LR: {lr:.2e} | "
-                            f"Update: {update_s}s"
+                            f"Update: {update_s}s | "
+                            f"Avg: {avg_update_s:.2f}s | "
+                            f"ETA: {eta_str}"
                         )
+                        if progress_bar is not None:
+                            progress_bar.set_postfix(
+                                loss=f"{loss.item():.4f}",
+                                lr=f"{lr:.2e}",
+                                eta=eta_str,
+                            )
                         # Wandb 日志
                         if self.use_wandb:
                             log_dict = {
@@ -903,6 +998,9 @@ class LoLATrainer:
                                 "train/step": self.global_step,
                                 "train/epoch": epoch,
                                 "train/update_s": update_s,
+                                "train/avg_update_s": avg_update_s,
+                                "train/progress_pct": progress_pct,
+                                "train/eta_seconds": eta_seconds,
                             }
                             # 添加 loss_dict 中的其他 loss
                             for k, v in loss_dict.items():
@@ -911,13 +1009,28 @@ class LoLATrainer:
                             wandb.log(log_dict)
 
                 # 保存 checkpoint
-                if self.global_step % self.save_every_n_steps == 0 and self.is_main_process:
+                should_save = self.save_every_n_steps > 0 and self.global_step % self.save_every_n_steps == 0
+                if should_save and (self.strategy == "fsdp" or self.is_main_process):
                     self.save_checkpoint(ckpt_dir, self.global_step)
 
+            if (
+                self.save_checkpoint_every_epoch
+                and self.global_step > 0
+                and (self.strategy == "fsdp" or self.is_main_process)
+            ):
+                self.save_checkpoint(
+                    ckpt_dir,
+                    self.global_step,
+                    tag=f"epoch_{epoch:03d}_step_{self.global_step:06d}",
+                )
+
         # 保存最终 checkpoint
-        if self.is_main_process:
+        if self.strategy == "fsdp" or self.is_main_process:
             self.save_checkpoint(ckpt_dir, self.global_step, is_final=True)
-            logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+            if self.is_main_process:
+                logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
+        if progress_bar is not None:
+            progress_bar.close()
 
         # 关闭 Wandb
         if self.use_wandb:
@@ -939,12 +1052,18 @@ class LoLATrainer:
                 {
                     "model": model_sd,
                     "optimizer": optimizer_sd,
-                    "step": [step],
                 },
                 checkpoint_id=ckpt_path,
             )
-            # scheduler 不支持 torch.distributed.checkpoint，单独用 torch.save 保存
+            # scheduler / trainer state 不走 torch.distributed.checkpoint，单独由主进程保存。
             if self.is_main_process:
+                trainer_state = {
+                    "step": int(step),
+                    "scheduler_state_dict": self.scheduler.state_dict(),
+                    "train_vlm": bool(self.train_vlm),
+                    "vlm_unfrozen": bool(self.vlm_unfrozen),
+                }
+                torch.save(trainer_state, os.path.join(ckpt_path, "trainer_state.pt"))
                 torch.save(
                     {"scheduler_state_dict": self.scheduler.state_dict()},
                     os.path.join(ckpt_path, "scheduler.pt"),
@@ -974,19 +1093,34 @@ class LoLATrainer:
 
             # FSDP checkpoint 加载：先获取空 state_dict 容器，再 load 填充，最后 set 回模型/优化器
             model_sd, optimizer_sd = get_state_dict(self.model, self.optimizer)
-            # 用 list 包装 step，因为 int 是不可变对象，load 无法原地修改
-            step_container = [0]
             load_fsdp_checkpoint(
-                {"model": model_sd, "optimizer": optimizer_sd, "step": step_container},
+                {"model": model_sd, "optimizer": optimizer_sd},
                 checkpoint_id=ckpt_path,
             )
             set_state_dict(self.model, self.optimizer, model_state_dict=model_sd, optim_state_dict=optimizer_sd)
-            self.global_step = step_container[0]
-            # 恢复 scheduler 状态
+
+            loaded_step = 0
+            trainer_state_path = os.path.join(ckpt_path, "trainer_state.pt")
+            if os.path.exists(trainer_state_path):
+                trainer_state = torch.load(trainer_state_path, map_location="cpu")
+                loaded_step = int(trainer_state.get("step", 0))
+                if "scheduler_state_dict" in trainer_state:
+                    self.scheduler.load_state_dict(trainer_state["scheduler_state_dict"])
+
+                if trainer_state.get("vlm_unfrozen", False) and not self.vlm_unfrozen:
+                    self._set_vlm_trainability(True)
+                    self.model.train()
+                    self.vlm_unfrozen = True
+
+            # 兼容旧 checkpoint：只有 scheduler.pt，没有可靠的 step 字段。
             scheduler_path = os.path.join(ckpt_path, "scheduler.pt")
             if os.path.exists(scheduler_path):
                 scheduler_ckpt = torch.load(scheduler_path, map_location=self.device)
                 self.scheduler.load_state_dict(scheduler_ckpt["scheduler_state_dict"])
+                loaded_step = max(loaded_step, int(self.scheduler.state_dict().get("last_epoch", 0)))
+
+            loaded_step = max(loaded_step, infer_step_from_checkpoint_path(ckpt_path))
+            self.global_step = loaded_step
         else:
             checkpoint = torch.load(ckpt_path, map_location=self.device)
             if self.is_distributed:
@@ -1045,6 +1179,11 @@ def main():
         "--save_checkpoint_on_vlm_unfreeze",
         action="store_true",
         help="Save a checkpoint right before switching from frozen-VLM to joint VLM+VLA training.",
+    )
+    parser.add_argument(
+        "--save_checkpoint_every_epoch",
+        action="store_true",
+        help="Save one checkpoint at the end of every epoch.",
     )
     parser.add_argument("--ckpt_dir", type=str, default="/data_16T/deepseek/checkpoints/lola")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
@@ -1206,6 +1345,8 @@ def main():
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=True,  # 分布式训练建议 drop_last
+        persistent_workers=args.num_workers > 0,
+        multiprocessing_context="spawn" if args.num_workers > 0 else None,
     )
 
     effective_max_steps = args.max_steps
@@ -1238,6 +1379,7 @@ def main():
         batch_transform=batch_transform,
         stage_train_vlm_after_epoch=args.stage_train_vlm_after_epoch,
         save_checkpoint_on_vlm_unfreeze=args.save_checkpoint_on_vlm_unfreeze,
+        save_checkpoint_every_epoch=args.save_checkpoint_every_epoch,
     )
 
     # 禁用 wandb

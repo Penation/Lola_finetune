@@ -83,6 +83,9 @@ coverage.xml
 logs/
 tmp/
 *.log
+*.out
+*.err
+*.pid
 pip-log.txt
 pip-delete-this-directory.txt
 celerybeat-schedule
@@ -166,6 +169,8 @@ wandb/
 # Data folders
 data/
 outputs/
+lola_ckpt/
+info.json
 
 # Translations
 *.mo
