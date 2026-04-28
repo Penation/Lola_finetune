@@ -16,6 +16,7 @@
 import glob
 import importlib
 import logging
+import os
 import shutil
 import tempfile
 import warnings
@@ -71,7 +72,13 @@ def decode_video_frames(
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, tolerance_frames)
     elif backend in ["pyav", "video_reader"]:
-        return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
+        return decode_video_frames_torchvision(
+            video_path,
+            timestamps,
+            tolerance_s,
+            tolerance_frames=tolerance_frames,
+            backend=backend,
+        )
     else:
         raise ValueError(f"Unsupported video backend: {backend}")
 
@@ -80,6 +87,7 @@ def decode_video_frames_torchvision(
     video_path: Path | str,
     timestamps: list[float],
     tolerance_s: float,
+    tolerance_frames: int | None = None,
     backend: str = "pyav",
     log_loaded_timestamps: bool = False,
 ) -> torch.Tensor:
@@ -148,33 +156,51 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    # PyAV can expose rounded PTS values that drift from the requested timestamps.
-    # For CALVIN videos this drift is small relative to the frame interval, but large
-    # enough to trip the default 1e-4s tolerance. Make the tolerance backend-specific
-    # and derive it from the observed frame spacing so we stay within half a frame.
     effective_tolerance_s = tolerance_s
+    effective_tolerance_frames = tolerance_frames
+    if backend == "pyav" and effective_tolerance_frames is None:
+        effective_tolerance_frames = 1
+
     if backend == "pyav" and len(loaded_ts) > 1:
         frame_deltas = torch.diff(loaded_ts)
         positive_frame_deltas = frame_deltas[frame_deltas > 0]
         if len(positive_frame_deltas) > 0:
-            inferred_half_frame_s = positive_frame_deltas.min().item() / 2
-            effective_tolerance_s = max(tolerance_s, inferred_half_frame_s)
+            inferred_frame_interval_s = torch.median(positive_frame_deltas).item()
+            if effective_tolerance_frames is not None:
+                frame_distance = min_ / inferred_frame_interval_s
+                is_within_tol = frame_distance <= effective_tolerance_frames
+                assert is_within_tol.all(), (
+                    "One or several query timestamps unexpectedly violate the frame tolerance "
+                    f"({frame_distance[~is_within_tol]} > effective_tolerance_frames={effective_tolerance_frames})."
+                    "It means that the closest frame that can be loaded from the video is more than the "
+                    "allowed number of frames away."
+                    "This might be due to synchronization issues with timestamps during data collection."
+                    "To be safe, we advise to ignore this item during training."
+                    f"\nqueried timestamps: {query_ts}"
+                    f"\nloaded timestamps: {loaded_ts}"
+                    f"\ninferred_frame_interval_s: {inferred_frame_interval_s}"
+                    f"\nvideo: {video_path}"
+                    f"\nbackend: {backend}"
+                )
+            else:
+                effective_tolerance_s = max(tolerance_s, inferred_frame_interval_s / 2)
         else:
             effective_tolerance_s = max(tolerance_s, 1e-3)
     elif backend == "pyav":
         effective_tolerance_s = max(tolerance_s, 1e-3)
-    is_within_tol = min_ <= effective_tolerance_s
-    assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance "
-        f"({min_[~is_within_tol]} > effective_tolerance_s={effective_tolerance_s})."
-        "It means that the closest frame that can be loaded from the video is too far away in time."
-        "This might be due to synchronization issues with timestamps during data collection."
-        "To be safe, we advise to ignore this item during training."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
-        f"\nvideo: {video_path}"
-        f"\nbackend: {backend}"
-    )
+    if effective_tolerance_frames is None or backend != "pyav" or len(loaded_ts) <= 1:
+        is_within_tol = min_ <= effective_tolerance_s
+        assert is_within_tol.all(), (
+            f"One or several query timestamps unexpectedly violate the tolerance "
+            f"({min_[~is_within_tol]} > effective_tolerance_s={effective_tolerance_s})."
+            "It means that the closest frame that can be loaded from the video is too far away in time."
+            "This might be due to synchronization issues with timestamps during data collection."
+            "To be safe, we advise to ignore this item during training."
+            f"\nqueried timestamps: {query_ts}"
+            f"\nloaded timestamps: {loaded_ts}"
+            f"\nvideo: {video_path}"
+            f"\nbackend: {backend}"
+        )
 
     # get closest frames to the query timestamps
     closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
@@ -216,8 +242,15 @@ class VideoDecoderCache:
         else:
             raise ImportError("torchcodec is required but not available.")
 
-        file_handle = fsspec.open(video_path).__enter__()
-        decoder = VideoDecoder(file_handle, seek_mode="approximate")
+        file_handle = None
+        decoder_source: str | bytes = video_path
+        if "://" in video_path and not os.path.exists(video_path):
+            file_handle = fsspec.open(video_path).__enter__()
+            decoder_source = file_handle.read()
+            file_handle.close()
+            file_handle = None
+
+        decoder = VideoDecoder(decoder_source, seek_mode="approximate")
         meta = decoder.metadata
         resolution = (meta.height, meta.width)
         return decoder, file_handle, resolution
@@ -255,7 +288,8 @@ class VideoDecoderCache:
         """Clear the cache and close file handles."""
         with self._lock:
             for _, file_handle, _ in self._cache.values():
-                file_handle.close()
+                if file_handle is not None:
+                    file_handle.close()
             self._cache.clear()
 
     def size(self) -> int:
@@ -285,15 +319,21 @@ def decode_video_frames_torchcodec(
 
     Args:
         tolerance_s: Fallback tolerance in seconds (used only when tolerance_frames is None).
-        tolerance_frames: Max allowed frame offset. When set, tolerance_s is computed as
-            (tolerance_frames + 0.5) / average_fps, adapting to each video's actual fps.
+        tolerance_frames: Max allowed frame offset from the closest decodable frame.
     """
     from torchcodec.decoders import VideoDecoder
     import torchvision # 用于 Fallback
 
     video_path_str = str(video_path)
-    file_handle = fsspec.open(video_path_str).__enter__()
-    decoder = VideoDecoder(file_handle, seek_mode="approximate")
+    file_handle = None
+    decoder_source: str | bytes = video_path_str
+    if "://" in video_path_str and not os.path.exists(video_path_str):
+        file_handle = fsspec.open(video_path_str).__enter__()
+        decoder_source = file_handle.read()
+        file_handle.close()
+        file_handle = None
+
+    decoder = VideoDecoder(decoder_source, seek_mode="approximate")
 
     try:
         # get metadata for frame information
@@ -301,10 +341,6 @@ def decode_video_frames_torchcodec(
         average_fps = metadata.average_fps
         num_frames = metadata.num_frames
 
-        # Compute tolerance_s from tolerance_frames if provided
-        if tolerance_frames is not None:
-            tolerance_s = (tolerance_frames + 0.5) / average_fps
-        
         # convert timestamps to frame indices
         frame_indices = [round(ts * average_fps) for ts in timestamps]
         clamped_mask = [idx >= num_frames or idx < 0 for idx in frame_indices]
@@ -360,13 +396,31 @@ def decode_video_frames_torchcodec(
         min_, argmin_ = dist.min(1)
 
         clamped_mask_tensor = torch.tensor(clamped_mask)
-        is_within_tol = min_ < tolerance_s
-        is_within_tol = is_within_tol | clamped_mask_tensor
+        if tolerance_frames is not None:
+            frame_distance = min_ * average_fps
+            is_within_tol = frame_distance <= tolerance_frames
+            is_within_tol = is_within_tol | clamped_mask_tensor
 
-        assert is_within_tol.all(), (
-            f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=}).\n"
-            f"queried timestamps: {query_ts}\nloaded timestamps: {loaded_ts_tensor}\nvideo: {video_path}"
-        )
+            assert is_within_tol.all(), (
+                "One or several query timestamps unexpectedly violate the frame tolerance "
+                f"({frame_distance[~is_within_tol]} > effective_tolerance_frames={tolerance_frames})."
+                "It means that the closest frame that can be loaded from the video is more than the "
+                "allowed number of frames away."
+                "This might be due to synchronization issues with timestamps during data collection."
+                "To be safe, we advise to ignore this item during training."
+                f"\nqueried timestamps: {query_ts}"
+                f"\nloaded timestamps: {loaded_ts_tensor}"
+                f"\naverage_fps: {average_fps}"
+                f"\nvideo: {video_path}"
+            )
+        else:
+            is_within_tol = min_ < tolerance_s
+            is_within_tol = is_within_tol | clamped_mask_tensor
+
+            assert is_within_tol.all(), (
+                f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=}).\n"
+                f"queried timestamps: {query_ts}\nloaded timestamps: {loaded_ts_tensor}\nvideo: {video_path}"
+            )
 
         # get closest frames to the query timestamps
         if is_dynamic_res:
@@ -398,7 +452,8 @@ def decode_video_frames_torchcodec(
 
     finally:
         try:
-            file_handle.close()
+            if file_handle is not None:
+                file_handle.close()
         except Exception:
             pass
 

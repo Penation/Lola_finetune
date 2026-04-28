@@ -13,6 +13,7 @@ examples/
 outputs/
 wandb/
 data/
+lola_ckpt/
 
 info.json
 README.md

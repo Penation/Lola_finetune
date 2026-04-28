@@ -23,6 +23,8 @@ LoLA专用数据集，支持加载从episode开始到当前帧的完整历史act
 - 支持左侧padding以处理变长历史序列
 """
 
+import logging
+
 import torch
 import torch.nn.functional as F
 from typing import Callable
@@ -67,6 +69,7 @@ class LoLADataset(LeRobotDataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        bad_sample_max_retries: int = 16,
     ):
         """
         Args:
@@ -83,6 +86,7 @@ class LoLADataset(LeRobotDataset):
             force_cache_sync: 是否强制同步缓存
             download_videos: 是否下载视频
             video_backend: 视频后端
+            bad_sample_max_retries: 坏样本最大跳过重试次数
         """
         super().__init__(
             repo_id=repo_id,
@@ -100,6 +104,7 @@ class LoLADataset(LeRobotDataset):
         self.max_history_length = max_history_length
         self.action_chunk_size = action_chunk_size
         self.history_padding_side = history_padding_side
+        self.bad_sample_max_retries = bad_sample_max_retries
 
         # 获取action维度
         if "action" in self.features:
@@ -111,22 +116,21 @@ class LoLADataset(LeRobotDataset):
         print(f"[LoLADataset] action_chunk_size: {action_chunk_size}")
         print(f"[LoLADataset] history_padding_side: {history_padding_side}")
         print(f"[LoLADataset] action_dim: {self.action_dim}")
-    
-    def __getitem__(self, idx) -> dict:
-        """
-        获取数据项，包含完整历史action。
+        print(f"[LoLADataset] bad_sample_max_retries: {bad_sample_max_retries}")
 
-        Returns:
-            dict with additional keys:
-            - hist_actions_full: [padded_length, action_dim] 历史action（含padding）
-            - hist_actions_mask: [padded_length] 标识真实action (1) vs padding (0)
-            - hist_actions_length: 标量，真实action数量
+    @staticmethod
+    def _is_skippable_sample_error(exc: Exception) -> bool:
+        if isinstance(exc, AssertionError):
+            message = str(exc)
+            return (
+                "unexpectedly violate the tolerance" in message
+                or "unexpectedly violate the frame tolerance" in message
+                or "ignore this item during training" in message
+            )
+        return False
 
-        Note:
-            padded_length 会被补齐到 action_chunk_size 的整数倍，
-            便于模型将每 action_chunk_size 个 action 合并为 1 个 Token。
-        """
-        # 调用父类方法获取基础数据
+    def _build_item(self, idx: int) -> dict:
+        """Build a single item for a resolved dataset index."""
         item = super().__getitem__(idx)
 
         # 获取episode信息
@@ -198,6 +202,57 @@ class LoLADataset(LeRobotDataset):
         item["hist_actions_length"] = torch.tensor(actual_history_length, dtype=torch.long)
 
         return item
+
+    def __getitem__(self, idx) -> dict:
+        """
+        获取数据项，包含完整历史action。
+
+        Returns:
+            dict with additional keys:
+            - hist_actions_full: [padded_length, action_dim] 历史action（含padding）
+            - hist_actions_mask: [padded_length] 标识真实action (1) vs padding (0)
+            - hist_actions_length: 标量，真实action数量
+
+        Note:
+            padded_length 会被补齐到 action_chunk_size 的整数倍，
+            便于模型将每 action_chunk_size 个 action 合并为 1 个 Token。
+        """
+        resolved_idx = idx
+        first_error = None
+
+        for retry_idx in range(self.bad_sample_max_retries + 1):
+            try:
+                return self._build_item(resolved_idx)
+            except Exception as exc:
+                if not self._is_skippable_sample_error(exc):
+                    raise
+
+                if first_error is None:
+                    first_error = exc
+
+                if retry_idx >= self.bad_sample_max_retries:
+                    raise RuntimeError(
+                        f"Exceeded bad sample retry budget starting from idx={idx}. "
+                        f"Last attempted idx={resolved_idx}."
+                    ) from first_error
+
+                # Skip ahead by a chunk to avoid getting stuck on a contiguous span
+                # of broken timestamps from the same corrupted video segment.
+                skip_stride = max(1, self.action_chunk_size)
+                next_idx = (resolved_idx + skip_stride) % len(self)
+                logging.warning(
+                    "Skipping bad sample idx=%s due to decode/timestamp error: %s. Retrying with idx=%s "
+                    "(retry %s/%s, stride=%s).",
+                    resolved_idx,
+                    str(exc).splitlines()[0],
+                    next_idx,
+                    retry_idx + 1,
+                    self.bad_sample_max_retries,
+                    skip_stride,
+                )
+                resolved_idx = next_idx
+
+        raise RuntimeError(f"Unexpected bad sample retry fallthrough for idx={idx}")
 
 
 class LoLADatasetMetadata(LeRobotDatasetMetadata):

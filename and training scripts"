@@ -1,0 +1,32 @@
+ .amltignore                                                             |   1 [32m+[m
+ docs/source/contributing.md                                             |   1 [31m-[m
+ src/lerobot/datasets/lerobot_dataset.py                                 |   1 [32m+[m
+ src/lerobot/datasets/lola_dataset.py                                    |  85 [32m+++++++[m[31m--[m
+ src/lerobot/datasets/video_utils.py                                     | 129 [32m++++++++++[m[31m----[m
+ src/lerobot/policies/act/README.md                                      |   1 [31m-[m
+ src/lerobot/policies/diffusion/README.md                                |   1 [31m-[m
+ src/lerobot/policies/groot/README.md                                    |   1 [31m-[m
+ src/lerobot/policies/groot/action_head/cross_attention_dit.py           |   0
+ src/lerobot/policies/groot/eagle2_hg_model/configuration_eagle2_5_vl.py |   0
+ src/lerobot/policies/groot/eagle2_hg_model/modeling_eagle2_5_vl.py      |   0
+ src/lerobot/policies/groot/eagle2_hg_model/processing_eagle2_5_vl.py    |   0
+ src/lerobot/policies/lola/modeling_lola.py                              |  14 [32m+[m[31m-[m
+ src/lerobot/policies/smolvla/README.md                                  |   1 [31m-[m
+ src/lerobot/policies/tdmpc/README.md                                    |   1 [31m-[m
+ src/lerobot/policies/vqbet/README.md                                    |   1 [31m-[m
+ src/lerobot/robots/hope_jr/hope_jr.mdx                                  |   1 [31m-[m
+ src/lerobot/robots/koch_follower/koch.mdx                               |   1 [31m-[m
+ src/lerobot/robots/lekiwi/lekiwi.mdx                                    |   1 [31m-[m
+ src/lerobot/robots/so100_follower/so100.mdx                             |   1 [31m-[m
+ src/lerobot/robots/so101_follower/so101.mdx                             |   1 [31m-[m
+ src/lerobot/scripts/amlt_decode_check.sh                                |  39 [32m+++++[m
+ src/lerobot/scripts/amlt_env_check.sh                                   |  53 [32m++++++[m
+ src/lerobot/scripts/audit_dataset_tolerance_torchcodec.py               | 155 [32m++++++++++++++++[m
+ src/lerobot/scripts/probe_lola_train_startup.py                         | 379 [32m++++++++++++++++++++++++++++++++++++++++[m
+ src/lerobot/scripts/test_amlt_preflight_local.py                        |  92 [32m++++++++++[m
+ src/lerobot/scripts/test_azure.sh                                       |  65 [32m++++++[m[31m-[m
+ src/lerobot/scripts/test_tolerance_frames.py                            | 124 [32m+++++++++++++[m
+ src/lerobot/scripts/test_torchcodec_runtime.py                          | 109 [32m++++++++++++[m
+ src/lerobot/scripts/train_lola_azure.py                                 |  47 [32m+++++[m
+ src/lerobot/scripts/validate_lola_train_dataloader_full.py              | 240 [32m+++++++++++++++++++++++++[m
+ 31 files changed, 1477 insertions(+), 68 deletions(-)

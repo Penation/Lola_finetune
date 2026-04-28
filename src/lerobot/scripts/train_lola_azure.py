@@ -43,6 +43,7 @@ LoLA Azure 分布式训练脚本 - 使用原生 PyTorch DDP
 import argparse
 import datetime
 import logging
+import math
 import os
 import re
 import sys
@@ -871,10 +872,15 @@ class LoLATrainer:
             skip_epochs = 0
             skip_batches = 0
 
+        planned_epochs = None
+        if batches_per_epoch is not None and batches_per_epoch > 0:
+            planned_epochs = math.ceil(self.max_steps / batches_per_epoch)
+
         epoch = 0
         total_update_time = 0.0
         total_logged_updates = 0
         progress_bar = None
+        resume_skip_bar = None
         if (
             self.is_main_process
             and tqdm is not None
@@ -890,6 +896,20 @@ class LoLATrainer:
                 smoothing=0.05,
                 leave=True,
             )
+            total_skip_batches = 0
+            if start_step > 0 and batches_per_epoch is not None:
+                total_skip_batches = skip_epochs * batches_per_epoch + skip_batches
+            if total_skip_batches > 0:
+                resume_skip_bar = tqdm(
+                    total=total_skip_batches,
+                    initial=0,
+                    desc="Resume skip",
+                    file=sys.stdout,
+                    dynamic_ncols=False,
+                    mininterval=1.0,
+                    smoothing=0.05,
+                    leave=True,
+                )
         if (
             self.stage_train_vlm_after_epoch > 0
             and batches_per_epoch is not None
@@ -906,6 +926,12 @@ class LoLATrainer:
             if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
 
+            if progress_bar is not None:
+                if planned_epochs is not None:
+                    progress_bar.set_description(f"LoLA train e{epoch}/{planned_epochs}")
+                else:
+                    progress_bar.set_description(f"LoLA train e{epoch}")
+
             self._maybe_unfreeze_vlm_for_epoch(epoch, ckpt_dir)
 
             for batch_idx, batch in enumerate(train_loader):
@@ -915,10 +941,26 @@ class LoLATrainer:
                 # Map-style 数据集：跳过已训练的 batch
                 if skip_epochs > 0 or skip_batches > 0:
                     if skip_epochs > 0:
+                        if resume_skip_bar is not None and batches_per_epoch is not None:
+                            resume_skip_bar.update(batches_per_epoch)
+                            remaining_skip = skip_epochs * batches_per_epoch + skip_batches - resume_skip_bar.n
+                            if remaining_skip < 0:
+                                remaining_skip = 0
+                            resume_skip_bar.set_postfix(remaining=remaining_skip)
                         skip_epochs -= 1
                         break  # 跳过整个 epoch
+                    if resume_skip_bar is not None:
+                        resume_skip_bar.update(1)
+                        remaining_skip = skip_batches - 1
+                        if remaining_skip < 0:
+                            remaining_skip = 0
+                        resume_skip_bar.set_postfix(remaining=remaining_skip)
                     skip_batches -= 1
                     continue
+
+                if resume_skip_bar is not None:
+                    resume_skip_bar.close()
+                    resume_skip_bar = None
 
                 step_start = time.monotonic()
 
@@ -986,6 +1028,7 @@ class LoLATrainer:
                         )
                         if progress_bar is not None:
                             progress_bar.set_postfix(
+                                epoch=f"{epoch}/{planned_epochs}" if planned_epochs is not None else str(epoch),
                                 loss=f"{loss.item():.4f}",
                                 lr=f"{lr:.2e}",
                                 eta=eta_str,
@@ -1018,6 +1061,8 @@ class LoLATrainer:
                 and self.global_step > 0
                 and (self.strategy == "fsdp" or self.is_main_process)
             ):
+                if self.is_main_process:
+                    logger.info(f"Saving epoch-end checkpoint for epoch {epoch} at step {self.global_step}")
                 self.save_checkpoint(
                     ckpt_dir,
                     self.global_step,
@@ -1031,6 +1076,8 @@ class LoLATrainer:
                 logger.info(f"Training completed! Final checkpoint saved at step {self.global_step}")
         if progress_bar is not None:
             progress_bar.close()
+        if resume_skip_bar is not None:
+            resume_skip_bar.close()
 
         # 关闭 Wandb
         if self.use_wandb:

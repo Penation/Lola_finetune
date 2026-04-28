@@ -1008,6 +1008,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 video_path,
                 shifted_query_ts,
                 self.tolerance_s,
+                tolerance_frames=1,
                 backend=self.video_backend,
             )
             item[vid_key] = frames.squeeze(0)

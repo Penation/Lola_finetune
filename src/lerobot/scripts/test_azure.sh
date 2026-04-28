@@ -39,6 +39,8 @@ LEARNING_RATE=2.5e-5
 LOG_EVERY_N_STEPS=10
 SAVE_INTERVAL=5000
 GRADIENT_CLIP_VAL=1.0
+NUM_WORKERS=4
+ENTRY_SCRIPT="src/lerobot/scripts/train_lola_azure.py"
 
 # 数据集参数
 DATASET_REPO_ID=""
@@ -51,6 +53,7 @@ CKPT_DIR="/mnt/wangxiaofa/checkpoints/lola-simpler"
 TRAIN_VLM=false
 STAGE_TRAIN_VLM_AFTER_EPOCH=0
 SAVE_CHECKPOINT_ON_VLM_UNFREEZE=false
+SAVE_CHECKPOINT_EVERY_EPOCH=false
 
 # 历史action加载参数
 LOAD_FULL_HISTORY=true
@@ -128,6 +131,14 @@ while [[ $# -gt 0 ]]; do
             GRADIENT_CLIP_VAL="$2"
             shift 2
             ;;
+        --num_workers)
+            NUM_WORKERS="$2"
+            shift 2
+            ;;
+        --entry_script)
+            ENTRY_SCRIPT="$2"
+            shift 2
+            ;;
 
         # 数据集参数
         --dataset_repo_id)
@@ -162,6 +173,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --save_checkpoint_on_vlm_unfreeze)
             SAVE_CHECKPOINT_ON_VLM_UNFREEZE=true
+            shift
+            ;;
+        --save_checkpoint_every_epoch)
+            SAVE_CHECKPOINT_EVERY_EPOCH=true
             shift
             ;;
 
@@ -222,6 +237,43 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# TorchCodec 依赖 conda 环境中的 FFmpeg 动态库。`conda run` 不保证所有后续
+# 子进程都能继承到正确的 loader 路径，因此这里显式补齐。
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    TORCH_LIB_DIR="$(python - <<'PY'
+import os
+import torch
+
+print(os.path.join(os.path.dirname(torch.__file__), "lib"))
+PY
+)"
+    if [[ -d "${TORCH_LIB_DIR}" ]]; then
+        EXTRA_LD_PATH="${TORCH_LIB_DIR}"
+    fi
+    if [[ -d "${CONDA_PREFIX}/lib" ]]; then
+        EXTRA_LD_PATH="${EXTRA_LD_PATH:+${EXTRA_LD_PATH}:}${CONDA_PREFIX}/lib"
+    fi
+    export LD_LIBRARY_PATH="${EXTRA_LD_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    export LIBRARY_PATH="${EXTRA_LD_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+fi
+
+if [[ "${VIDEO_BACKEND}" == "torchcodec" ]]; then
+    echo "TorchCodec runtime:"
+    echo "  - CONDA_PREFIX: ${CONDA_PREFIX:-<unset>}"
+    echo "  - TORCH_LIB_DIR: ${TORCH_LIB_DIR:-<unset>}"
+    echo "  - LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:-<unset>}"
+    ls -1 "${CONDA_PREFIX}/lib"/libavutil.so* 2>/dev/null || true
+    python - <<'PY'
+import importlib.util
+import torch
+
+print("torch file:", torch.__file__)
+print("torchcodec spec:", getattr(importlib.util.find_spec("torchcodec"), "origin", None))
+from torchcodec.decoders import VideoDecoder
+print("torchcodec decoder import OK:", VideoDecoder.__name__)
+PY
+fi
+
 
 # 打印配置信息
 echo "========================================"
@@ -242,10 +294,13 @@ echo "  - Max steps: ${MAX_STEPS}"
 echo "  - Max epochs: ${MAX_EPOCHS}"
 echo "  - Learning rate: ${LEARNING_RATE}"
 echo "  - Gradient clip: ${GRADIENT_CLIP_VAL}"
+echo "  - Num workers: ${NUM_WORKERS}"
 echo "  - Dataset: ${DATASET_REPO_ID:-$DATASET_ROOT}"
 echo "  - Video backend: ${VIDEO_BACKEND:-auto}"
 echo "  - VLM path: ${VLM_PATH}"
 echo "  - Stage train VLM after epoch: ${STAGE_TRAIN_VLM_AFTER_EPOCH}"
+echo "  - Resume: ${RESUME:-<none>}"
+echo "  - Entry script: ${ENTRY_SCRIPT}"
 echo "========================================"
 
 # ----------------------------------------------------------------------
@@ -256,7 +311,7 @@ echo "========================================"
 if [ "$NNODES" -eq 1 ]; then
     # 单节点：使用简化的 torchrun 命令
     cmd="torchrun --nproc_per_node=${NPROC_PER_NODE} \
-        src/lerobot/scripts/train_lola_azure.py \
+        ${ENTRY_SCRIPT} \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
         --max_steps ${MAX_STEPS} \
@@ -264,6 +319,7 @@ if [ "$NNODES" -eq 1 ]; then
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
         --save_every_n_steps ${SAVE_INTERVAL} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --num_workers ${NUM_WORKERS} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
         --wandb_project ${WANDB_PROJECT}"
@@ -275,7 +331,7 @@ else
         --node_rank=${NODE_RANK} \
         --master_addr=${MASTER_ADDR} \
         --master_port=${MASTER_PORT} \
-        src/lerobot/scripts/train_lola_azure.py \
+        ${ENTRY_SCRIPT} \
         --strategy ${STRATEGY} \
         --batch_size ${BATCH_SIZE} \
         --max_steps ${MAX_STEPS} \
@@ -283,6 +339,7 @@ else
         --log_every_n_steps ${LOG_EVERY_N_STEPS} \
         --save_every_n_steps ${SAVE_INTERVAL} \
         --gradient_clip_val ${GRADIENT_CLIP_VAL} \
+        --num_workers ${NUM_WORKERS} \
         --vlm_path ${VLM_PATH} \
         --ckpt_dir ${CKPT_DIR} \
         --wandb_project ${WANDB_PROJECT}"
@@ -327,6 +384,10 @@ fi
 
 if [ "$SAVE_CHECKPOINT_ON_VLM_UNFREEZE" = true ]; then
     cmd="${cmd} --save_checkpoint_on_vlm_unfreeze"
+fi
+
+if [ "$SAVE_CHECKPOINT_EVERY_EPOCH" = true ]; then
+    cmd="${cmd} --save_checkpoint_every_epoch"
 fi
 
 # Wandb 参数

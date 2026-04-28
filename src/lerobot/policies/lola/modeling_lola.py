@@ -22,6 +22,7 @@ from diffusers.models.transformers.transformer_flux2 import (
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.lola.configuration_lola import LoLAConfig
+from lerobot.utils.constants import OBS_LANGUAGE_TOKENS
 
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
 
@@ -824,7 +825,8 @@ class LoLAPolicy(PreTrainedPolicy):
         Args:
             batch: 包含输入数据的字典，可能包含以下键:
                 - "input_ids": 文本 token IDs [B, seq_len]
-                - "observation.language_tokens": 语言指令 tokens (备选)
+                - "observation.language.tokens": 语言指令 tokens (LeRobot 标准键)
+                - "observation.language_tokens": 语言指令 tokens (兼容旧错误键名)
                 - "pixel_values": 图像像素值 (用于视觉输入)
                 - "image_grid_thw": 图像网格信息 (Qwen3.5 视觉模型需要)
                 - "attention_mask": 注意力掩码
@@ -836,6 +838,8 @@ class LoLAPolicy(PreTrainedPolicy):
         # 1. 提取 input_ids
         if "input_ids" in batch:
             input_ids = batch["input_ids"]
+        elif OBS_LANGUAGE_TOKENS in batch:
+            input_ids = batch[OBS_LANGUAGE_TOKENS]
         elif "observation.language_tokens" in batch:
             input_ids = batch["observation.language_tokens"]
         else:
@@ -846,6 +850,8 @@ class LoLAPolicy(PreTrainedPolicy):
         # 2. 提取视觉输入（如果有）
         pixel_values = batch.get("pixel_values", None)
         image_grid_thw = batch.get("image_grid_thw", None)
+        video_grid_thw = batch.get("video_grid_thw", None)
+        mm_token_type_ids = batch.get("mm_token_type_ids", None)
         attention_mask = batch.get("attention_mask", None)
 
         # 3. 调用 Qwen3.5 获取 hidden_states
@@ -870,6 +876,10 @@ class LoLAPolicy(PreTrainedPolicy):
                 forward_kwargs["pixel_values"] = pixel_values
             if image_grid_thw is not None:
                 forward_kwargs["image_grid_thw"] = image_grid_thw
+            if video_grid_thw is not None:
+                forward_kwargs["video_grid_thw"] = video_grid_thw
+            if mm_token_type_ids is not None:
+                forward_kwargs["mm_token_type_ids"] = mm_token_type_ids
             if attention_mask is not None:
                 forward_kwargs["attention_mask"] = attention_mask
 
